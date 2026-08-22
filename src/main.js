@@ -115,7 +115,10 @@ function loadConfig(environment) {
         clientSecret: requiredEnv(`${prefix}_CLIENT_SECRET`),
         ruName: requiredEnv(`${prefix}_RU_NAME`),
 
-        scopes: scopesFromEnvironmentVariable(`${prefix}_SCOPES`),
+        // The eBay keysets share one approved scope list in Appwrite.
+        // Environment selection still controls credentials, RuName, and
+        // endpoint; scopes remain the single EBAY_OAUTH_SCOPES variable.
+        scopes: scopesFromEnvironmentVariable('EBAY_OAUTH_SCOPES'),
 
         appReturnUrl: requiredEnv('EBAY_APP_RETURN_URL'),
 
