@@ -32,6 +32,14 @@ function requiredEnv(name) {
     return value;
 }
 
+function cleanText(value, maxLength = 8_000) {
+    if (typeof value !== 'string') return '';
+    const cleaned = value.trim();
+    return cleaned.length <= maxLength
+        ? cleaned
+        : cleaned.slice(0, maxLength);
+}
+
 function normalizeEnvironment(value, label = 'environment') {
     const normalized = String(value ?? '').trim().toLowerCase();
 
