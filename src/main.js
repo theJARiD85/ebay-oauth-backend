@@ -15,6 +15,10 @@ const EbayAuthToken = require('ebay-oauth-nodejs-client');
 const STATE_TTL_MS = 10 * 60 * 1000;
 const EBAY_CALLBACK_PATH = '/oauth/ebay/callback';
 const EBAY_DECLINED_PATH = '/oauth/ebay/declined';
+// Keep the earlier portal routes working while the eBay developer portal
+// finishes moving to the shared /oauth/ebay/* callback paths.
+const LEGACY_EBAY_CALLBACK_PATH = '/oauth/callback';
+const LEGACY_EBAY_DECLINED_PATH = '/oauth/declined';
 
 class HttpError extends Error {
     constructor(status, message) {
@@ -1063,6 +1067,40 @@ async function handleCallback({
     databases,
     declinedPath,
 }) {
+    const legacyAuthToken =
+        queryValue(
+            req,
+            'ebaytkn',
+        );
+
+    const legacyTokenExpiry =
+        queryValue(
+            req,
+            'tknexp',
+        );
+
+    const legacyUsername =
+        queryValue(
+            req,
+            'username',
+        );
+
+    if (
+        legacyAuthToken ||
+        legacyTokenExpiry ||
+        legacyUsername
+    ) {
+        error(
+            "eBay returned the legacy Auth'n'Auth callback parameters. " +
+                'That flow does not provide an OAuth 2 authorization code or refresh token.',
+        );
+
+        return res.redirect(
+            fallbackAppReturnUrl('error'),
+            302,
+        );
+    }
+
     const returnedState =
         queryValue(
             req,
@@ -1235,8 +1273,12 @@ export default async function main({
 
         if (
             req.method === 'GET' &&
-            (path === EBAY_CALLBACK_PATH ||
-                path === EBAY_DECLINED_PATH)
+            (
+                path === EBAY_CALLBACK_PATH ||
+                path === LEGACY_EBAY_CALLBACK_PATH ||
+                path === EBAY_DECLINED_PATH ||
+                path === LEGACY_EBAY_DECLINED_PATH
+            )
         ) {
             return await handleCallback({
                 req,
@@ -1245,7 +1287,8 @@ export default async function main({
                 error,
                 databases,
                 declinedPath:
-                    path === EBAY_DECLINED_PATH,
+                    path === EBAY_DECLINED_PATH ||
+                    path === LEGACY_EBAY_DECLINED_PATH,
             });
         }
 
