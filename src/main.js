@@ -205,14 +205,33 @@ function createAdminDatabases(req) {
     return new Databases(client);
 }
 
-async function authenticatedUserId(req) {
+function logEbayOAuthAuthentication(log, event, details = {}) {
+    if (typeof log !== 'function') return;
+
+    log(
+        `[KeepFlip eBay OAuth auth] ${event} ` +
+            JSON.stringify(details),
+    );
+}
+
+async function authenticatedUserId(req, log) {
     const executionUserId =
         requestHeader(req?.headers, 'x-appwrite-user-id');
-    const userJwt =
-        requestHeader(req?.headers, 'x-appwrite-user-jwt') ||
+    const automaticUserJwt =
+        requestHeader(req?.headers, 'x-appwrite-user-jwt');
+    const fallbackUserJwt =
         requestHeader(req?.headers, 'x-keepflip-user-jwt');
+    const userJwt = automaticUserJwt || fallbackUserJwt;
+
+    logEbayOAuthAuthentication(log, 'received /connect-or-status request', {
+        automaticUserJwt: automaticUserJwt ? 'jwt' : 'missing',
+        executionUserId: executionUserId ? 'present' : 'missing',
+        fallbackUserJwt: fallbackUserJwt ? 'jwt' : 'missing',
+    });
 
     if (!userJwt) {
+        logEbayOAuthAuthentication(log, 'rejected request: no JWT header');
+
         throw new HttpError(
             401,
             'You must be signed in to KeepFlip to connect eBay.',
@@ -236,7 +255,15 @@ async function authenticatedUserId(req) {
             account.get(),
             account.getSession({ sessionId: 'current' }),
         ]);
-    } catch {
+    } catch (caught) {
+        logEbayOAuthAuthentication(log, 'rejected request: JWT validation failed', {
+            appwriteCode: Number.isFinite(Number(caught?.code))
+                ? Number(caught.code)
+                : 'unknown',
+            appwriteType: cleanText(caught?.type) || 'unknown',
+            jwtSource: automaticUserJwt ? 'automatic' : 'fallback',
+        });
+
         throw new HttpError(
             401,
             'You must be signed in to KeepFlip to connect eBay.',
@@ -248,6 +275,17 @@ async function authenticatedUserId(req) {
     const userId =
         cleanText(user?.$id);
 
+    logEbayOAuthAuthentication(log, 'JWT account lookup completed', {
+        executionUserId: executionUserId ? 'present' : 'missing',
+        provider: provider || 'missing',
+        sessionMatchesUser:
+            Boolean(session?.userId) && session.userId === userId,
+        userId: userId ? 'present' : 'missing',
+        userMatchesExecutionHeader:
+            !executionUserId || executionUserId === userId,
+        userStatus: Boolean(user?.status),
+    });
+
     if (
         !user?.status ||
         !userId ||
@@ -257,11 +295,24 @@ async function authenticatedUserId(req) {
         !provider ||
         provider === 'anonymous'
     ) {
+        logEbayOAuthAuthentication(log, 'rejected request: account or session mismatch', {
+            provider: provider || 'missing',
+            sessionMatchesUser:
+                Boolean(session?.userId) && session.userId === userId,
+            userMatchesExecutionHeader:
+                !executionUserId || executionUserId === userId,
+        });
+
         throw new HttpError(
             401,
             'You must be signed in to KeepFlip to connect eBay.',
         );
     }
+
+    logEbayOAuthAuthentication(log, 'accepted authenticated user', {
+        jwtSource: automaticUserJwt ? 'automatic' : 'fallback',
+        provider,
+    });
 
     return userId;
 }
@@ -1186,9 +1237,10 @@ async function handleConnect({
     req,
     res,
     databases,
+    log,
 }) {
     const userId =
-        await authenticatedUserId(req);
+        await authenticatedUserId(req, log);
 
     const environment =
         normalizeEnvironment(
@@ -1237,9 +1289,10 @@ async function handleStatus({
     req,
     res,
     databases,
+    log,
 }) {
     const userId =
-        await authenticatedUserId(req);
+        await authenticatedUserId(req, log);
 
     const environment =
         normalizeEnvironment(
@@ -1327,9 +1380,10 @@ async function handleRefresh({
     req,
     res,
     databases,
+    log,
 }) {
     const userId =
-        await authenticatedUserId(req);
+        await authenticatedUserId(req, log);
 
     const environment =
         normalizeEnvironment(
@@ -1665,6 +1719,7 @@ export default async function main({
                 req,
                 res,
                 databases,
+                log,
             });
         }
 
@@ -1676,6 +1731,7 @@ export default async function main({
                 req,
                 res,
                 databases,
+                log,
             });
         }
 
@@ -1687,6 +1743,7 @@ export default async function main({
                 req,
                 res,
                 databases,
+                log,
             });
         }
 
