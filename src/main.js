@@ -1,4 +1,4 @@
-import { Client, Databases, Query } from 'node-appwrite';
+import { Account, Client, Databases, Query } from 'node-appwrite';
 import {
     createCipheriv,
     createDecipheriv,
@@ -205,10 +205,54 @@ function createAdminDatabases(req) {
     return new Databases(client);
 }
 
-function authenticatedUserId(req) {
-    const userId = req.headers['x-appwrite-user-id'];
+async function authenticatedUserId(req) {
+    const userId =
+        requestHeader(req?.headers, 'x-appwrite-user-id');
+    const userJwt =
+        requestHeader(req?.headers, 'x-appwrite-user-jwt');
 
-    if (!userId) {
+    if (!userId || !userJwt) {
+        throw new HttpError(
+            401,
+            'You must be signed in to KeepFlip to connect eBay.',
+        );
+    }
+
+    const client = new Client()
+        .setEndpoint(
+            requiredEnv('APPWRITE_FUNCTION_API_ENDPOINT'),
+        )
+        .setProject(
+            requiredEnv('APPWRITE_FUNCTION_PROJECT_ID'),
+        )
+        .setJWT(userJwt);
+    const account = new Account(client);
+
+    let user;
+    let session;
+    try {
+        [user, session] = await Promise.all([
+            account.get(),
+            account.getSession({ sessionId: 'current' }),
+        ]);
+    } catch {
+        throw new HttpError(
+            401,
+            'You must be signed in to KeepFlip to connect eBay.',
+        );
+    }
+
+    const provider =
+        cleanText(session?.provider).toLowerCase();
+
+    if (
+        !user?.status ||
+        user.$id !== userId ||
+        !session?.userId ||
+        session.userId !== userId ||
+        !provider ||
+        provider === 'anonymous'
+    ) {
         throw new HttpError(
             401,
             'You must be signed in to KeepFlip to connect eBay.',
@@ -633,8 +677,8 @@ function hashEbayUserId(ebayUserId) {
 
 function ebayIdentityEndpoint(environment) {
     return environment === 'production'
-        ? 'https://api.ebay.com/commerce/identity/v1/user/'
-        : 'https://api.sandbox.ebay.com/commerce/identity/v1/user/';
+        ? 'https://apiz.ebay.com/commerce/identity/v1/user/'
+        : 'https://apiz.sandbox.ebay.com/commerce/identity/v1/user/';
 }
 
 async function getEbayIdentity(config, accessToken) {
@@ -1140,7 +1184,7 @@ async function handleConnect({
     databases,
 }) {
     const userId =
-        authenticatedUserId(req);
+        await authenticatedUserId(req);
 
     const environment =
         normalizeEnvironment(
@@ -1191,7 +1235,7 @@ async function handleStatus({
     databases,
 }) {
     const userId =
-        authenticatedUserId(req);
+        await authenticatedUserId(req);
 
     const environment =
         normalizeEnvironment(
@@ -1281,7 +1325,7 @@ async function handleRefresh({
     databases,
 }) {
     const userId =
-        authenticatedUserId(req);
+        await authenticatedUserId(req);
 
     const environment =
         normalizeEnvironment(
