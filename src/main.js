@@ -249,12 +249,8 @@ async function authenticatedUserId(req, log) {
     const account = new Account(client);
 
     let user;
-    let session;
     try {
-        [user, session] = await Promise.all([
-            account.get(),
-            account.getSession({ sessionId: 'current' }),
-        ]);
+        user = await account.get();
     } catch (caught) {
         logEbayOAuthAuthentication(log, 'rejected request: JWT validation failed', {
             appwriteCode: Number.isFinite(Number(caught?.code))
@@ -270,16 +266,19 @@ async function authenticatedUserId(req, log) {
         );
     }
 
-    const provider =
-        cleanText(session?.provider).toLowerCase();
+    // A JWT is a stateless proof of an active Appwrite session. It can verify
+    // Account.get(), but it is not a session cookie, so getSession('current')
+    // correctly returns user_session_not_found in this Server SDK context.
+    // KeepFlip establishes email-password sessions, while anonymous accounts
+    // have no email; require that durable identity here.
+    const userEmail =
+        cleanText(user?.email);
     const userId =
         cleanText(user?.$id);
 
     logEbayOAuthAuthentication(log, 'JWT account lookup completed', {
+        accountEmail: userEmail ? 'present' : 'missing',
         executionUserId: executionUserId ? 'present' : 'missing',
-        provider: provider || 'missing',
-        sessionMatchesUser:
-            Boolean(session?.userId) && session.userId === userId,
         userId: userId ? 'present' : 'missing',
         userMatchesExecutionHeader:
             !executionUserId || executionUserId === userId,
@@ -288,19 +287,15 @@ async function authenticatedUserId(req, log) {
 
     if (
         !user?.status ||
+        !userEmail ||
         !userId ||
-        (executionUserId && executionUserId !== userId) ||
-        !session?.userId ||
-        session.userId !== userId ||
-        !provider ||
-        provider === 'anonymous'
+        (executionUserId && executionUserId !== userId)
     ) {
-        logEbayOAuthAuthentication(log, 'rejected request: account or session mismatch', {
-            provider: provider || 'missing',
-            sessionMatchesUser:
-                Boolean(session?.userId) && session.userId === userId,
+        logEbayOAuthAuthentication(log, 'rejected request: account mismatch', {
+            accountEmail: userEmail ? 'present' : 'missing',
             userMatchesExecutionHeader:
                 !executionUserId || executionUserId === userId,
+            userStatus: Boolean(user?.status),
         });
 
         throw new HttpError(
@@ -311,7 +306,6 @@ async function authenticatedUserId(req, log) {
 
     logEbayOAuthAuthentication(log, 'accepted authenticated user', {
         jwtSource: automaticUserJwt ? 'automatic' : 'fallback',
-        provider,
     });
 
     return userId;
