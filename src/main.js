@@ -143,6 +143,11 @@ function loadConfig(environment) {
             process.env.APPWRITE_CONNECTIONS_COLLECTION_ID?.trim() ||
             'ebay_connections',
 
+        oauthStatesCollectionId:
+            process.env.APPWRITE_EBAY_OAUTH_STATES_COLLECTION_ID?.trim() ||
+            process.env.APPWRITE_EBAY_STATES_COLLECTION_ID?.trim() ||
+            'ebay_oauth_states',
+
         encryptionKey: tokenEncryptionKey(),
         stateSecret: stateSecret(),
     };
@@ -405,6 +410,16 @@ function connectionDocumentId(
     return createHash('sha256')
         .update(
             `${userId}:${environment}`,
+            'utf8',
+        )
+        .digest('base64url')
+        .slice(0, 36);
+}
+
+function oauthStateDocumentId(state) {
+    return createHash('sha256')
+        .update(
+            `keepflip|ebay-oauth-state|v1|${state}`,
             'utf8',
         )
         .digest('base64url')
