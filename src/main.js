@@ -149,12 +149,14 @@ function loadConfig(environment) {
 }
 
 function createEbayClient(config) {
-    return new EbayAuthToken({
-        clientId: config.clientId,
-        clientSecret: config.clientSecret,
-        redirectUri: config.ruName,
-        env: config.ebayEnvironment,
-    });
+    const ebayAuthClient = new EbayAuthToken(
+        {
+            clientId: config.clientId,
+            clientSecret: config.clientSecret,
+            redirectUri: config.ruName,
+            env: config.ebayEnvironment,
+        });
+    return ebayAuthClient;
 }
 
 function requestHeader(headers, name) {
@@ -640,17 +642,42 @@ async function getEbayIdentity(config, accessToken) {
         );
     }
 
+    const responseText = await response.text();
     let payload = {};
 
     try {
-        payload = JSON.parse(await response.text());
+        payload = JSON.parse(responseText);
     } catch {
         payload = {};
     }
 
     if (!response.ok) {
+        const firstProviderError =
+            Array.isArray(payload?.errors) ? payload.errors[0] : null;
+        const providerErrorId = cleanText(
+            firstProviderError?.errorId ||
+                payload?.errorId ||
+                payload?.error,
+            80,
+        );
+        const providerMessage = cleanText(
+            firstProviderError?.message ||
+                firstProviderError?.longMessage ||
+                payload?.error_description ||
+                payload?.message,
+            300,
+        );
+        const providerDetail = [
+            providerErrorId,
+            providerMessage,
+        ]
+            .filter(Boolean)
+            .join(': ');
+
         throw new Error(
-            'eBay Identity rejected the connected account lookup.',
+            `eBay Identity rejected the connected account lookup (HTTP ${response.status}${
+                providerDetail ? `: ${providerDetail}` : ''
+            }).`,
         );
     }
 
@@ -933,16 +960,31 @@ async function handleConnect({
             'OAuth environment',
         );
 
-    // The app owns the pre-generated eBay login URL. This endpoint only
-    // issues a signed, one-time state that binds the callback to this user.
+    const config =
+        loadConfig(environment);
+
+    // Generate the authorization URL on the server so the client never has
+    // to duplicate eBay credentials, RuNames, scopes, or environment rules.
+    // The signed state binds the eventual callback to this authenticated user
+    // and expires after STATE_TTL_MS; it must not be replaced by a raw user ID.
     const state =
         createState(
             userId,
             environment,
-            stateSecret(),
+            config.stateSecret,
+        );
+
+    const authorizationUrl =
+        createEbayClient(config).generateUserAuthorizationUrl(
+            config.ebayEnvironment,
+            config.scopes,
+            {
+                state,
+            },
         );
 
     return res.json({
+        authorizationUrl,
         state,
         environment,
     });
