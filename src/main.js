@@ -1519,6 +1519,23 @@ async function handleCallback({
             302,
         );
     } catch (caught) {
+        if (stateClaimed) {
+            const marked =
+                await markOAuthState({
+                    databases,
+                    config,
+                    documentId: stateDocumentId,
+                    status: "failed",
+                    failureCode: "CALLBACK_FAILED",
+                });
+
+            if (!marked) {
+                error(
+                    "eBay OAuth state could not be marked failed.",
+                );
+            }
+        }
+
         error(
             `eBay ${config.environment} OAuth callback failed: ${caught?.message || String(caught)}`,
         );
