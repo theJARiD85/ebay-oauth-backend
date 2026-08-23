@@ -206,12 +206,13 @@ function createAdminDatabases(req) {
 }
 
 async function authenticatedUserId(req) {
-    const userId =
+    const executionUserId =
         requestHeader(req?.headers, 'x-appwrite-user-id');
     const userJwt =
-        requestHeader(req?.headers, 'x-appwrite-user-jwt');
+        requestHeader(req?.headers, 'x-appwrite-user-jwt') ||
+        requestHeader(req?.headers, 'x-keepflip-user-jwt');
 
-    if (!userId || !userJwt) {
+    if (!userJwt) {
         throw new HttpError(
             401,
             'You must be signed in to KeepFlip to connect eBay.',
@@ -244,10 +245,13 @@ async function authenticatedUserId(req) {
 
     const provider =
         cleanText(session?.provider).toLowerCase();
+    const userId =
+        cleanText(user?.$id);
 
     if (
         !user?.status ||
-        user.$id !== userId ||
+        !userId ||
+        (executionUserId && executionUserId !== userId) ||
         !session?.userId ||
         session.userId !== userId ||
         !provider ||
