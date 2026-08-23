@@ -422,7 +422,7 @@ function oauthStateDocumentId(state) {
             `keepflip|ebay-oauth-state|v1|${state}`,
             'utf8',
         )
-        .digest('base64url')
+        .digest('hex')
         .slice(0, 36);
 }
 
