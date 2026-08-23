@@ -962,9 +962,182 @@ function appReturnUrl(
     return url.toString();
 }
 
+async function createOAuthStateRecord({
+    databases,
+    config,
+    userId,
+    state,
+}) {
+    const now = new Date();
+    const createdAt = now.toISOString();
+    const expiresAt = new Date(
+        now.getTime() + STATE_TTL_MS,
+    ).toISOString();
+
+    try {
+        await databases.createDocument({
+            databaseId:
+                config.databaseId,
+            collectionId:
+                config.oauthStatesCollectionId,
+            documentId:
+                oauthStateDocumentId(state),
+            data: {
+                ownerId: userId,
+                environment: config.environment,
+                status: "pending",
+                scopeText: config.scopes.join(" "),
+                createdAt,
+                expiresAt,
+            },
+        });
+    } catch {
+        throw new Error(
+            "KeepFlip could not save the eBay OAuth state.",
+        );
+    }
+}
+
+async function claimOAuthState({
+    databases,
+    config,
+    state,
+    payload,
+}) {
+    const documentId =
+        oauthStateDocumentId(state);
+
+    let record;
+
+    try {
+        record =
+            await databases.getDocument({
+                databaseId:
+                    config.databaseId,
+                collectionId:
+                    config.oauthStatesCollectionId,
+                documentId,
+            });
+    } catch (caught) {
+        if (Number(caught?.code) === 404) {
+            throw new HttpError(
+                400,
+                "The eBay OAuth state is missing or invalid.",
+            );
+        }
+
+        throw new Error(
+            "KeepFlip could not read the eBay OAuth state.",
+        );
+    }
+
+    const expiresAt =
+        Date.parse(
+            String(record?.expiresAt || ""),
+        );
+
+    if (
+        record?.ownerId !== payload.userId ||
+        record?.environment !== payload.environment ||
+        record?.status !== "pending" ||
+        !Number.isFinite(expiresAt) ||
+        expiresAt <= Date.now()
+    ) {
+        throw new HttpError(
+            400,
+            "The eBay OAuth state has expired, was already used, or does not match this callback.",
+        );
+    }
+
+    const claimedAt =
+        new Date().toISOString();
+
+    let updateResponse;
+
+    try {
+        updateResponse =
+            await databases.updateDocuments({
+                databaseId:
+                    config.databaseId,
+                collectionId:
+                    config.oauthStatesCollectionId,
+                queries: [
+                    Query.equal(
+                        "$id",
+                        documentId,
+                    ),
+                    Query.equal(
+                        "status",
+                        "pending",
+                    ),
+                ],
+                data: {
+                    status: "processing",
+                    claimedAt,
+                },
+            });
+    } catch {
+        throw new Error(
+            "KeepFlip could not claim the eBay OAuth state.",
+        );
+    }
+
+    const updatedCount =
+        Number(
+            updateResponse?.total ??
+                updateResponse?.documents?.length ??
+                0,
+        );
+
+    if (updatedCount < 1) {
+        throw new HttpError(
+            400,
+            "The eBay OAuth state has expired, was already used, or does not match this callback.",
+        );
+    }
+
+    return {
+        documentId,
+        claimedAt,
+    };
+}
+
+async function markOAuthState({
+    databases,
+    config,
+    documentId,
+    status,
+    failureCode,
+}) {
+    const data = {
+        status,
+        completedAt:
+            new Date().toISOString(),
+    };
+
+    if (failureCode) {
+        data.failureCode = failureCode;
+    }
+
+    try {
+        await databases.updateDocument({
+            databaseId:
+                config.databaseId,
+            collectionId:
+                config.oauthStatesCollectionId,
+            documentId,
+            data,
+        });
+        return true;
+    } catch {
+        return false;
+    }
+}
+
 async function handleConnect({
     req,
     res,
+    databases,
 }) {
     const userId =
         authenticatedUserId(req);
@@ -997,6 +1170,13 @@ async function handleConnect({
                 state,
             },
         );
+
+    await createOAuthStateRecord({
+        databases,
+        config,
+        userId,
+        state,
+    });
 
     return res.json({
         authorizationUrl,
@@ -1208,6 +1388,8 @@ async function handleCallback({
 
     let state;
     let config;
+    let stateDocumentId;
+    let stateClaimed = false;
 
     try {
         state = verifyState(
@@ -1215,6 +1397,17 @@ async function handleCallback({
             stateSecret(),
         );
         config = loadConfig(state.environment);
+
+        const claim =
+            await claimOAuthState({
+                databases,
+                config,
+                state: returnedState,
+                payload: state,
+            });
+
+        stateDocumentId = claim.documentId;
+        stateClaimed = true;
     } catch (caught) {
         error(
             `eBay OAuth callback state validation failed: ${caught?.message || String(caught)}`,
@@ -1255,6 +1448,20 @@ async function handleCallback({
             `eBay ${config.environment} authorization was declined or returned without a code.`,
         );
 
+        const marked =
+            await markOAuthState({
+                databases,
+                config,
+                documentId: stateDocumentId,
+                status: "declined",
+            });
+
+        if (!marked) {
+            error(
+                "eBay OAuth state could not be marked declined.",
+            );
+        }
+
         return res.redirect(
             appReturnUrl(
                 config,
@@ -1285,6 +1492,20 @@ async function handleCallback({
             tokenResponse,
             ebayIdentity,
         });
+
+        const marked =
+            await markOAuthState({
+                databases,
+                config,
+                documentId: stateDocumentId,
+                status: "completed",
+            });
+
+        if (!marked) {
+            error(
+                "eBay OAuth state could not be marked completed.",
+            );
+        }
 
         log(
             `eBay ${config.environment} account connected for KeepFlip user ${state.userId}.`,
@@ -1378,6 +1599,7 @@ export default async function main({
             return await handleConnect({
                 req,
                 res,
+                databases,
             });
         }
 
