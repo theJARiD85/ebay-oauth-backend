@@ -1,4 +1,4 @@
-import { Account, Client, Databases, Query } from 'node-appwrite';
+import { Client, Databases, Query } from 'node-appwrite';
 import {
     createCipheriv,
     createDecipheriv,
@@ -214,89 +214,22 @@ function logEbayOAuthAuthentication(log, event, details = {}) {
     );
 }
 
-async function authenticatedUserId(req, log) {
-    const executionUserId =
-        requestHeader(req?.headers, 'x-appwrite-user-id');
-    const automaticUserJwt =
-        requestHeader(req?.headers, 'x-appwrite-user-jwt');
-    const fallbackUserJwt =
-        requestHeader(req?.headers, 'x-keepflip-user-jwt');
-    const userJwt = automaticUserJwt || fallbackUserJwt;
-
-    logEbayOAuthAuthentication(log, 'received /connect-or-status request', {
-        automaticUserJwt: automaticUserJwt ? 'jwt' : 'missing',
-        executionUserId: executionUserId ? 'present' : 'missing',
-        fallbackUserJwt: fallbackUserJwt ? 'jwt' : 'missing',
-    });
-
-    if (!userJwt) {
-        logEbayOAuthAuthentication(log, 'rejected request: no JWT header');
-
-        throw new HttpError(
-            401,
-            'You must be signed in to KeepFlip to connect eBay.',
-        );
-    }
-
-    const client = new Client()
-        .setEndpoint(
-            requiredEnv('APPWRITE_FUNCTION_API_ENDPOINT'),
-        )
-        .setProject(
-            requiredEnv('APPWRITE_FUNCTION_PROJECT_ID'),
-        )
-        .setJWT(userJwt);
-    const account = new Account(client);
-
-    let user;
-    try {
-        user = await account.get();
-    } catch (caught) {
-        logEbayOAuthAuthentication(log, 'rejected request: JWT validation failed', {
-            appwriteCode: Number.isFinite(Number(caught?.code))
-                ? Number(caught.code)
-                : 'unknown',
-            appwriteType: cleanText(caught?.type) || 'unknown',
-            jwtSource: automaticUserJwt ? 'automatic' : 'fallback',
-        });
-
-        throw new HttpError(
-            401,
-            'You must be signed in to KeepFlip to connect eBay.',
-        );
-    }
-
-    // A JWT is a stateless proof of an active Appwrite session. It can verify
-    // Account.get(), but it is not a session cookie, so getSession('current')
-    // correctly returns user_session_not_found in this Server SDK context.
-    // KeepFlip establishes email-password sessions, while anonymous accounts
-    // have no email; require that durable identity here.
-    const userEmail =
-        cleanText(user?.email);
+function authenticatedUserId(req, log) {
+    // Appwrite injects this value only when an authenticated SDK execution
+    // invokes the Function. Keep this Function's Execute access set to users;
+    // the public eBay callback belongs to keepflip-ebay-oauth instead.
     const userId =
-        cleanText(user?.$id);
+        requestHeader(req?.headers, 'x-appwrite-user-id');
 
-    logEbayOAuthAuthentication(log, 'JWT account lookup completed', {
-        accountEmail: userEmail ? 'present' : 'missing',
-        executionUserId: executionUserId ? 'present' : 'missing',
-        userId: userId ? 'present' : 'missing',
-        userMatchesExecutionHeader:
-            !executionUserId || executionUserId === userId,
-        userStatus: Boolean(user?.status),
+    logEbayOAuthAuthentication(log, 'received authenticated app request', {
+        executionUserId: userId ? 'present' : 'missing',
     });
 
-    if (
-        !user?.status ||
-        !userEmail ||
-        !userId ||
-        (executionUserId && executionUserId !== userId)
-    ) {
-        logEbayOAuthAuthentication(log, 'rejected request: account mismatch', {
-            accountEmail: userEmail ? 'present' : 'missing',
-            userMatchesExecutionHeader:
-                !executionUserId || executionUserId === userId,
-            userStatus: Boolean(user?.status),
-        });
+    if (!userId) {
+        logEbayOAuthAuthentication(
+            log,
+            'rejected request: authenticated execution user is missing',
+        );
 
         throw new HttpError(
             401,
@@ -305,7 +238,7 @@ async function authenticatedUserId(req, log) {
     }
 
     logEbayOAuthAuthentication(log, 'accepted authenticated user', {
-        jwtSource: automaticUserJwt ? 'automatic' : 'fallback',
+        executionUserId: 'present',
     });
 
     return userId;
@@ -500,6 +433,23 @@ function connectionDocumentId(
     userId,
     environment,
 ) {
+    // Appwrite custom IDs may not start with "-" or "_". Prefix the
+    // deterministic hex digest to make every new connection ID valid.
+    return `e${
+        createHash('sha256')
+            .update(
+                `${userId}:${environment}`,
+                'utf8',
+            )
+            .digest('hex')
+            .slice(0, 35)
+    }`;
+}
+
+function legacyConnectionDocumentId(
+    userId,
+    environment,
+) {
     return createHash('sha256')
         .update(
             `${userId}:${environment}`,
@@ -507,6 +457,10 @@ function connectionDocumentId(
         )
         .digest('base64url')
         .slice(0, 36);
+}
+
+function isAppwriteDocumentId(value) {
+    return /^[A-Za-z0-9][A-Za-z0-9._-]{0,35}$/.test(value);
 }
 
 function oauthStateDocumentId(state) {
@@ -859,11 +813,16 @@ function tokenBundleFromResponse(
 
 function readTokenBundle(connection, config) {
     let parsed;
+    const tokenCiphertext =
+        typeof connection?.tokenCiphertext === 'string' &&
+        connection.tokenCiphertext
+            ? connection.tokenCiphertext
+            : connection?.encryptedTokens;
 
     try {
         parsed = JSON.parse(
             decryptSecret(
-                connection?.encryptedTokens,
+                tokenCiphertext,
                 config.encryptionKey,
             ),
         );
@@ -899,32 +858,42 @@ async function saveNewConnection({
         config,
         tokenResponse,
     );
+    const existingConnection =
+        await getConnection(
+            databases,
+            config,
+            userId,
+        );
+    const documentId =
+        existingConnection?.$id ||
+        connectionDocumentId(
+            userId,
+            config.environment,
+        );
 
     await databases.upsertDocument({
         databaseId:
             config.databaseId,
         collectionId:
             config.connectionsCollectionId,
-        documentId:
-            connectionDocumentId(
-                userId,
-                config.environment,
-            ),
+        documentId,
         data: {
             ownerId: userId,
-            hashedEbayId: hashEbayUserId(
+            environment: config.environment,
+            ebayUserIdHmac: hashEbayUserId(
                 ebayIdentity.userId,
             ),
-            encryptedTokens: encryptSecret(
+            status: 'active',
+            tokenCiphertext: encryptSecret(
                 JSON.stringify(tokenBundle),
                 config.encryptionKey,
             ),
-            ebayUsername:
-                cleanText(
-                    ebayIdentity.username ||
-                        ebayIdentity.userId,
-                    255,
-                ) || ebayIdentity.userId,
+            accessTokenExpiresAt:
+                tokenBundle.accessTokenExpiresAt,
+            refreshTokenExpiresAt:
+                tokenBundle.refreshTokenExpiresAt,
+            scopeText: tokenBundle.scopeList,
+            createdAt: tokenBundle.connectedAt,
             revokedAt: null,
             updatedAt: tokenBundle.updatedAt,
         },
@@ -936,27 +905,46 @@ async function getConnection(
     config,
     userId,
 ) {
-    const documentId =
+    const currentDocumentId =
         connectionDocumentId(
             userId,
             config.environment,
         );
+    const legacyDocumentId =
+        legacyConnectionDocumentId(
+            userId,
+            config.environment,
+        );
+    const documentIds = [
+        currentDocumentId,
+    ];
 
-    try {
-        return await databases.getDocument({
-            databaseId:
-                config.databaseId,
-            collectionId:
-                config.connectionsCollectionId,
-            documentId,
-        });
-    } catch (caught) {
-        if (Number(caught?.code) === 404) {
-            return null;
-        }
-
-        throw caught;
+    if (
+        legacyDocumentId !== currentDocumentId &&
+        isAppwriteDocumentId(legacyDocumentId)
+    ) {
+        documentIds.push(legacyDocumentId);
     }
+
+    for (const documentId of documentIds) {
+        try {
+            return await databases.getDocument({
+                databaseId:
+                    config.databaseId,
+                collectionId:
+                    config.connectionsCollectionId,
+                documentId,
+            });
+        } catch (caught) {
+            if (Number(caught?.code) === 404) {
+                continue;
+            }
+
+            throw caught;
+        }
+    }
+
+    return null;
 }
 
 async function refreshStoredConnection({
@@ -1002,10 +990,16 @@ async function refreshStoredConnection({
         documentId:
             connection.$id,
         data: {
-            encryptedTokens: encryptSecret(
+            status: 'active',
+            tokenCiphertext: encryptSecret(
                 JSON.stringify(tokenBundle),
                 config.encryptionKey,
             ),
+            accessTokenExpiresAt:
+                tokenBundle.accessTokenExpiresAt,
+            refreshTokenExpiresAt:
+                tokenBundle.refreshTokenExpiresAt,
+            scopeText: tokenBundle.scopeList,
             revokedAt: null,
             updatedAt: tokenBundle.updatedAt,
         },
@@ -1663,10 +1657,28 @@ export default async function main({
             return res.json({
                 ok: true,
                 service:
-                    'KeepFlip eBay OAuth',
+                    'KeepFlip eBay OAuth backend',
                 flow:
                     'authorization_code',
             });
+        }
+
+        if (
+            req.method === 'GET' &&
+            (
+                path === EBAY_CALLBACK_PATH ||
+                path === LEGACY_EBAY_CALLBACK_PATH ||
+                path === EBAY_DECLINED_PATH ||
+                path === LEGACY_EBAY_DECLINED_PATH
+            )
+        ) {
+            return res.json(
+                {
+                    error:
+                        'eBay callback routes are handled by the KeepFlip eBay OAuth callback Function.',
+                },
+                404,
+            );
         }
 
         const callbackRequest =
