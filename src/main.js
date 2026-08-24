@@ -57,6 +57,26 @@ function normalizeEnvironment(value, label = 'environment') {
     return normalized;
 }
 
+function opaqueOAuthState(value) {
+    if (typeof value !== 'string') {
+        throw new HttpError(
+            400,
+            'The eBay OAuth state is missing or invalid.',
+        );
+    }
+
+    const state = value.trim();
+
+    if (!/^[A-Za-z0-9_-]{32,128}$/.test(state)) {
+        throw new HttpError(
+            400,
+            'The eBay OAuth state is missing or invalid.',
+        );
+    }
+
+    return state;
+}
+
 function ebayEnvironmentName(environment) {
     return environment === 'production' ? 'PRODUCTION' : 'SANDBOX';
 }
@@ -150,6 +170,22 @@ function loadConfig(environment) {
 
         encryptionKey: tokenEncryptionKey(),
         stateSecret: stateSecret(),
+    };
+}
+
+function loadOAuthStateStoreConfig() {
+    return {
+        databaseId:
+            process.env.APPWRITE_EBAY_DATABASE_ID?.trim() ||
+            process.env.APPWRITE_DATABASE_ID?.trim() ||
+            'keepflip',
+
+        oauthStatesCollectionId:
+            process.env.APPWRITE_EBAY_OAUTH_STATES_COLLECTION_ID?.trim() ||
+            process.env.APPWRITE_EBAY_STATES_COLLECTION_ID?.trim() ||
+            'ebay_oauth_states',
+
+        scopes: scopesFromEnvironmentVariable('EBAY_OAUTH_SCOPES'),
     };
 }
 
@@ -1053,6 +1089,7 @@ async function createOAuthStateRecord({
     databases,
     config,
     userId,
+    environment,
     state,
 }) {
     const now = new Date();
@@ -1071,13 +1108,15 @@ async function createOAuthStateRecord({
                 oauthStateDocumentId(state),
             data: {
                 ownerId: userId,
-                environment: config.environment,
+                environment,
                 status: "pending",
                 scopeText: config.scopes.join(" "),
                 createdAt,
                 expiresAt,
             },
         });
+
+        return { expiresAt };
     } catch {
         throw new Error(
             "KeepFlip could not save the eBay OAuth state.",
@@ -1229,46 +1268,34 @@ async function handleConnect({
 }) {
     const userId =
         await authenticatedUserId(req, log);
+    const body = requestBody(req);
 
     const environment =
         normalizeEnvironment(
-            requestBody(req).environment,
+            body.environment,
             'OAuth environment',
         );
+    const state = opaqueOAuthState(
+        body.state,
+    );
 
     const config =
-        loadConfig(environment);
+        loadOAuthStateStoreConfig();
 
-    // Generate the authorization URL on the server so the client never has
-    // to duplicate eBay credentials, RuNames, scopes, or environment rules.
-    // The signed state binds the eventual callback to this authenticated user
-    // and expires after STATE_TTL_MS; it must not be replaced by a raw user ID.
-    const state =
-        createState(
-            userId,
-            environment,
-            config.stateSecret,
-        );
-
-    const authorizationUrl =
-        createEbayClient(config).generateUserAuthorizationUrl(
-            config.ebayEnvironment,
-            config.scopes,
-            {
-                state,
-            },
-        );
-
-    await createOAuthStateRecord({
+    // The app owns the browser redirect and authorization URL. This endpoint
+    // only registers the opaque, app-generated state against its authenticated
+    // KeepFlip user before the browser is opened.
+    const stateRecord = await createOAuthStateRecord({
         databases,
         config,
         userId,
+        environment,
         state,
     });
 
     return res.json({
-        authorizationUrl,
-        state,
+        expiresAt: stateRecord.expiresAt,
+        registered: true,
         environment,
     });
 }
