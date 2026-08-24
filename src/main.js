@@ -189,6 +189,28 @@ function loadOAuthStateStoreConfig() {
     };
 }
 
+function loadConnectionStoreConfig(environment) {
+    const normalized = normalizeEnvironment(environment);
+
+    return {
+        environment: normalized,
+
+        databaseId:
+            process.env.APPWRITE_EBAY_DATABASE_ID?.trim() ||
+            process.env.APPWRITE_DATABASE_ID?.trim() ||
+            'keepflip',
+
+        connectionsCollectionId:
+            process.env.APPWRITE_EBAY_CONNECTIONS_COLLECTION_ID?.trim() ||
+            process.env.APPWRITE_CONNECTIONS_COLLECTION_ID?.trim() ||
+            'ebay_connections',
+
+        // Status only reads the encrypted connection. It must not depend on
+        // OAuth client credentials, scopes, or callback-only state settings.
+        encryptionKey: tokenEncryptionKey(),
+    };
+}
+
 function createEbayClient(config) {
     const ebayAuthClient = new EbayAuthToken(
         {
@@ -716,8 +738,8 @@ function hashEbayUserId(ebayUserId) {
 
 function ebayIdentityEndpoint(environment) {
     return environment === 'production'
-        ? 'https://api.ebay.com/commerce/identity/v1/user/'
-        : 'https://api.sandbox.ebay.com/commerce/identity/v1/user/';
+        ? 'https://apiz.ebay.com/commerce/identity/v1/user/'
+        : 'https://apiz.sandbox.ebay.com/commerce/identity/v1/user/';
 }
 
 async function getEbayIdentity(config, accessToken) {
@@ -915,21 +937,19 @@ async function saveNewConnection({
         documentId,
         data: {
             ownerId: userId,
-            environment: config.environment,
-            ebayUserIdHmac: hashEbayUserId(
+            hashedEbayId: hashEbayUserId(
                 ebayIdentity.userId,
             ),
-            status: 'active',
-            tokenCiphertext: encryptSecret(
+            encryptedTokens: encryptSecret(
                 JSON.stringify(tokenBundle),
                 config.encryptionKey,
             ),
-            accessTokenExpiresAt:
-                tokenBundle.accessTokenExpiresAt,
-            refreshTokenExpiresAt:
-                tokenBundle.refreshTokenExpiresAt,
-            scopeText: tokenBundle.scopeList,
-            createdAt: tokenBundle.connectedAt,
+            ebayUsername:
+                cleanText(
+                    ebayIdentity.username ||
+                        ebayIdentity.userId,
+                    255,
+                ) || ebayIdentity.userId,
             revokedAt: null,
             updatedAt: tokenBundle.updatedAt,
         },
@@ -1026,16 +1046,10 @@ async function refreshStoredConnection({
         documentId:
             connection.$id,
         data: {
-            status: 'active',
-            tokenCiphertext: encryptSecret(
+            encryptedTokens: encryptSecret(
                 JSON.stringify(tokenBundle),
                 config.encryptionKey,
             ),
-            accessTokenExpiresAt:
-                tokenBundle.accessTokenExpiresAt,
-            refreshTokenExpiresAt:
-                tokenBundle.refreshTokenExpiresAt,
-            scopeText: tokenBundle.scopeList,
             revokedAt: null,
             updatedAt: tokenBundle.updatedAt,
         },
@@ -1316,7 +1330,7 @@ async function handleStatus({
         );
 
     const config =
-        loadConfig(environment);
+        loadConnectionStoreConfig(environment);
 
     const connection =
         await getConnection(
@@ -1343,10 +1357,18 @@ async function handleStatus({
                 connection,
                 config,
             );
-    } catch {
+    } catch (caught) {
+        log(
+            '[KeepFlip eBay OAuth status] stored token data could not be decrypted ' +
+                JSON.stringify({
+                    environment,
+                    reason: caught?.message || String(caught),
+                }),
+        );
+
         throw new HttpError(
             500,
-            'KeepFlip could not read the stored eBay connection.',
+            'Stored eBay token data could not be decrypted. Verify that the callback and eBay backend Functions use the same EBAY_TOKEN_ENCRYPTION_KEY.',
         );
     }
 
