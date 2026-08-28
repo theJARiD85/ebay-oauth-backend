@@ -61,7 +61,7 @@ function tokenCiphertext(tokenBundle) {
   );
 }
 
-test('creates a server-owned state and the matching eBay consent URL', async () => {
+test('creates a server-owned state for the app-owned eBay consent URL', async () => {
   configureEnvironment();
   const calls = [];
   const handler = createHandler({
@@ -104,21 +104,10 @@ test('creates a server-owned state and the matching eBay consent URL', async () 
   assert.equal(result.body.ok, true);
   assert.equal(result.body.environment, 'sandbox');
 
-  const authorizationUrl = new URL(result.body.authorizationUrl);
-  const state = authorizationUrl.searchParams.get('state');
-  assert.equal(authorizationUrl.origin, 'https://auth.sandbox.ebay.com');
-  assert.equal(authorizationUrl.pathname, '/oauth2/authorize');
-  assert.equal(authorizationUrl.searchParams.get('client_id'), 'sandbox-client-id');
-  assert.equal(
-    authorizationUrl.searchParams.get('redirect_uri'),
-    'KeepFlip-TheJa-SBX-123',
-  );
-  assert.equal(authorizationUrl.searchParams.get('response_type'), 'code');
-  assert.equal(
-    authorizationUrl.searchParams.get('scope'),
-    'https://api.ebay.com/oauth/api_scope https://api.ebay.com/oauth/api_scope/commerce.identity.readonly',
-  );
-  assert.match(state, /^[A-Za-z0-9_-]{43}$/);
+  assert.match(result.body.state, /^[A-Za-z0-9_-]{43}$/);
+  assert.equal(typeof result.body.expiresAt, 'string');
+  assert.equal('authorizationUrl' in result.body, false);
+  const state = result.body.state;
 
   const stateWrite = calls.find(
     (call) =>
@@ -320,3 +309,4 @@ test('rejects app calls that do not carry an Appwrite user session', async () =>
     'You must be signed in to KeepFlip to connect eBay.',
   );
 });
+

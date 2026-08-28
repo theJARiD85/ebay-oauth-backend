@@ -315,22 +315,6 @@ function createOpaqueState(randomBytesImpl) {
   return randomBytesImpl(32).toString('base64url');
 }
 
-export function buildAuthorizationUrl(configuration, state) {
-  const origin =
-    configuration.environment === 'production'
-      ? 'https://auth.ebay.com'
-      : 'https://auth.sandbox.ebay.com';
-  const url = new URL('/oauth2/authorize', origin);
-
-  url.searchParams.set('client_id', configuration.clientId);
-  url.searchParams.set('redirect_uri', configuration.ruName);
-  url.searchParams.set('response_type', 'code');
-  url.searchParams.set('scope', configuration.scopeText);
-  url.searchParams.set('state', state);
-
-  return url.toString();
-}
-
 async function createStateRecord({
   fetchImpl,
   req,
@@ -741,7 +725,7 @@ async function handleConnect({
   const userId = await authenticatedUserId({ req, fetchImpl, runtime });
   const state = createOpaqueState(randomBytesImpl);
 
-  await createStateRecord({
+  const stateRecord = await createStateRecord({
     fetchImpl,
     req,
     runtime,
@@ -751,10 +735,13 @@ async function handleConnect({
     now,
   });
 
+  // The app owns the browser URL. This endpoint only issues and records the
+  // one-time state that the callback will claim and verify.
   return res.json({
     ok: true,
     environment,
-    authorizationUrl: buildAuthorizationUrl(configuration, state),
+    state,
+    expiresAt: stateRecord.expiresAt,
   });
 }
 
@@ -958,3 +945,5 @@ export const __testables = {
 };
 
 export default createHandler();
+
+
