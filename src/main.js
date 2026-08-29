@@ -8,6 +8,7 @@ import {
 export const KEEPFLIP_EBAY_USER_SCOPES = Object.freeze([
   'https://api.ebay.com/oauth/api_scope',
   'https://api.ebay.com/oauth/api_scope/commerce.identity.readonly',
+  'https://api.ebay.com/oauth/api_scope/sell.inventory',
 ]);
 
 const STATE_TTL_MS = 10 * 60 * 1000;
@@ -120,6 +121,31 @@ function tableConfiguration() {
         'APPWRITE_EBAY_STATES_COLLECTION_ID',
       ],
       'ebay_oauth_states',
+    ),
+    itemsTableId: firstEnvironmentValue(
+      [
+        'APPWRITE_EBAY_ITEMS_TABLE_ID',
+        'APPWRITE_EBAY_ITEMS_COLLECTION_ID',
+        'APPWRITE_ITEMS_TABLE_ID',
+        'APPWRITE_ITEMS_COLLECTION_ID',
+      ],
+      'items',
+    ),
+    itemPhotosTableId: firstEnvironmentValue(
+      [
+        'APPWRITE_EBAY_ITEM_PHOTOS_TABLE_ID',
+        'APPWRITE_EBAY_ITEM_PHOTOS_COLLECTION_ID',
+        'APPWRITE_ITEM_PHOTOS_TABLE_ID',
+        'APPWRITE_ITEM_PHOTOS_COLLECTION_ID',
+      ],
+      'item_photos',
+    ),
+    itemImagesBucketId: firstEnvironmentValue(
+      [
+        'APPWRITE_EBAY_ITEM_IMAGES_BUCKET_ID',
+        'APPWRITE_ITEM_IMAGES_BUCKET_ID',
+      ],
+      'item_images',
     ),
   };
 }
@@ -712,6 +738,537 @@ async function markConnectionRevoked({
   }
 }
 
+
+const EBAY_INVENTORY_CONDITIONS = new Set([
+  'NEW',
+  'NEW_OTHER',
+  'NEW_WITH_DEFECTS',
+  'LIKE_NEW',
+  'CERTIFIED_REFURBISHED',
+  'EXCELLENT_REFURBISHED',
+  'VERY_GOOD_REFURBISHED',
+  'GOOD_REFURBISHED',
+  'SELLER_REFURBISHED',
+  'USED_EXCELLENT',
+  'USED_VERY_GOOD',
+  'USED_GOOD',
+  'USED_ACCEPTABLE',
+  'FOR_PARTS_OR_NOT_WORKING',
+]);
+
+function bodyObject(value) {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+}
+
+function requiredListingValue(body, name, maxLength = 255) {
+  const value = cleanText(body?.[name], maxLength);
+  if (!value) {
+    throw new HttpError(400, 'eBay listing field "' + name + '" is required.');
+  }
+  return value;
+}
+
+function listingString(value, maxLength = 255) {
+  return cleanText(value, maxLength);
+}
+
+function listingNumber(value, name, { integer = false, minimum = 0 } = {}) {
+  const number = Number(value);
+  if (
+    !Number.isFinite(number) ||
+    number < minimum ||
+    (integer && !Number.isInteger(number))
+  ) {
+    throw new HttpError(400, 'eBay listing field "' + name + '" is invalid.');
+  }
+  return number;
+}
+
+function stringArray(value) {
+  if (Array.isArray(value)) {
+    return value
+      .filter((entry) => typeof entry === 'string')
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+  }
+
+  if (typeof value !== 'string' || !value.trim()) return [];
+  const cleaned = value.trim();
+  try {
+    const parsed = JSON.parse(cleaned);
+    if (Array.isArray(parsed)) return stringArray(parsed);
+  } catch {
+    // Appwrite string columns can contain one cover photo ID directly.
+  }
+  return [cleaned];
+}
+
+function equalTableQuery(attribute, value) {
+  return 'equal(' + JSON.stringify(attribute) + ',' + JSON.stringify([value]) + ')';
+}
+
+async function getOwnedInventoryItem({
+  fetchImpl,
+  req,
+  runtime,
+  configuration,
+  userId,
+  itemId,
+}) {
+  let item;
+  try {
+    item = await appwriteJson({
+      fetchImpl,
+      req,
+      runtime,
+      apiKey: functionDynamicKey(req),
+      path: rowPath(configuration, configuration.itemsTableId, itemId),
+      failureMessage: 'KeepFlip could not read that inventory item.',
+    });
+  } catch (caught) {
+    if (caught instanceof UpstreamError && caught.status === 404) {
+      throw new HttpError(404, 'That inventory item could not be found.');
+    }
+    throw new HttpError(500, 'KeepFlip could not read that inventory item.');
+  }
+
+  if (item?.ownerId !== userId) {
+    throw new HttpError(403, 'You do not have access to this inventory item.');
+  }
+  return item;
+}
+
+async function listInventoryPhotoRows({
+  fetchImpl,
+  req,
+  runtime,
+  configuration,
+  item,
+}) {
+  const itemId = cleanText(item?.$id || item?.id, 64);
+  const ownerId = cleanText(item?.ownerId, 64);
+  if (!itemId || !ownerId) return [];
+
+  const queries = new URLSearchParams();
+  queries.append('queries[]', equalTableQuery('ownerId', ownerId));
+  queries.append('queries[]', equalTableQuery('itemId', itemId));
+  queries.append('queries[]', 'limit(100)');
+
+  try {
+    const response = await appwriteJson({
+      fetchImpl,
+      req,
+      runtime,
+      apiKey: functionDynamicKey(req),
+      path:
+        tableRowsPath(configuration, configuration.itemPhotosTableId) +
+        '?' +
+        queries.toString(),
+      failureMessage: 'KeepFlip could not read the saved item photos.',
+    });
+    return Array.isArray(response?.rows) ? response.rows : [];
+  } catch {
+    // The item-level photo array remains the source of truth when an older
+    // table does not support one of the optional photo queries.
+    return [];
+  }
+}
+
+async function getInventoryPhotoFileIds({
+  fetchImpl,
+  req,
+  runtime,
+  configuration,
+  item,
+}) {
+  const ids = [
+    ...stringArray(item?.coverPhotoId),
+    ...stringArray(item?.itemPhotos),
+  ];
+  const photoRows = await listInventoryPhotoRows({
+    fetchImpl,
+    req,
+    runtime,
+    configuration,
+    item,
+  });
+
+  for (const row of photoRows) {
+    ids.push(...stringArray(row?.fileId));
+  }
+
+  const uniqueIds = [...new Set(ids)].slice(0, 12);
+  if (!uniqueIds.length) {
+    throw new HttpError(400, 'Add at least one item photo before publishing on eBay.');
+  }
+  return uniqueIds;
+}
+
+function appwriteFileViewUrl(runtime, configuration, fileId) {
+  return (
+    runtime.endpoint +
+    '/storage/buckets/' +
+    encodeURIComponent(configuration.itemImagesBucketId) +
+    '/files/' +
+    encodeURIComponent(fileId) +
+    '/view?project=' +
+    encodeURIComponent(runtime.projectId)
+  );
+}
+
+function ebayApiBase(configuration) {
+  return configuration.environment === 'production'
+    ? 'https://api.ebay.com'
+    : 'https://api.sandbox.ebay.com';
+}
+
+function eBayApiErrorDetail(payload, rawBody) {
+  const details = [];
+  if (Array.isArray(payload?.errors)) {
+    for (const entry of payload.errors) {
+      const detail = entry?.longMessage || entry?.message || entry?.errorDescription;
+      if (detail) details.push(cleanText(detail, 300));
+    }
+  }
+  if (payload?.message) details.push(cleanText(payload.message, 300));
+  if (!details.length && rawBody) {
+    details.push(cleanText(rawBody.replace(/\s+/g, ' '), 300));
+  }
+  return [...new Set(details)].join(' ');
+}
+
+async function ebayApiRequest({
+  fetchImpl,
+  configuration,
+  accessToken,
+  method,
+  path,
+  body,
+}) {
+  let response;
+  try {
+    response = await fetchImpl(ebayApiBase(configuration) + path, {
+      method,
+      headers: {
+        Accept: 'application/json',
+        'Accept-Language': 'en-US',
+        'Content-Language': 'en-US',
+        Authorization: 'Bearer ' + accessToken,
+        ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
+      },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    });
+  } catch {
+    throw new HttpError(502, 'KeepFlip could not reach eBay to publish this listing.');
+  }
+
+  const rawBody = await response.text();
+  let payload = {};
+  if (rawBody.trim()) {
+    try {
+      payload = JSON.parse(rawBody);
+    } catch {
+      payload = {};
+    }
+  }
+
+  if (!response.ok) {
+    const detail = eBayApiErrorDetail(payload, rawBody);
+    const failure = new HttpError(
+      502,
+      'eBay rejected the listing request (HTTP ' +
+        response.status +
+        ')' +
+        (detail ? ': ' + detail : '.'),
+    );
+    failure.ebayStatus = response.status;
+    throw failure;
+  }
+
+  return { payload, status: response.status };
+}
+
+async function ensureEbayAccessToken({
+  fetchImpl,
+  req,
+  runtime,
+  configuration,
+  connection,
+  now,
+  randomBytesImpl,
+}) {
+  const storedTokens = readTokenBundle(connection, configuration);
+  const accessExpiry = Date.parse(storedTokens.accessTokenExpiresAt || '');
+  if (Number.isFinite(accessExpiry) && accessExpiry > currentDate(now).getTime() + 60_000) {
+    return storedTokens.accessToken;
+  }
+
+  const refreshedTokens = await refreshToken({
+    fetchImpl,
+    configuration,
+    tokenBundle: storedTokens,
+    now,
+  });
+  await saveRefreshedConnection({
+    fetchImpl,
+    req,
+    runtime,
+    configuration,
+    connection,
+    tokenBundle: refreshedTokens,
+    randomBytesImpl,
+  });
+  return refreshedTokens.accessToken;
+}
+
+async function findExistingEbayOffer({
+  fetchImpl,
+  configuration,
+  accessToken,
+  sku,
+  marketplaceId,
+}) {
+  const query = new URLSearchParams({
+    sku,
+    marketplace_id: marketplaceId,
+  });
+  try {
+    const result = await ebayApiRequest({
+      fetchImpl,
+      configuration,
+      accessToken,
+      method: 'GET',
+      path: '/sell/inventory/v1/offer?' + query.toString(),
+    });
+    const offers = Array.isArray(result.payload?.offers)
+      ? result.payload.offers
+      : [];
+    return (
+      offers.find(
+        (offer) =>
+          String(offer?.marketplaceId || offer?.marketplace_id || '') ===
+          marketplaceId,
+      ) || null
+    );
+  } catch (caught) {
+    if (caught?.ebayStatus === 404) return null;
+    throw caught;
+  }
+}
+
+function listingUrl(configuration, listingId) {
+  const host =
+    configuration.environment === 'production'
+      ? 'https://www.ebay.com/itm/'
+      : 'https://www.sandbox.ebay.com/itm/';
+  return host + encodeURIComponent(listingId);
+}
+
+async function handleEbayListing({
+  req,
+  res,
+  fetchImpl,
+  runtime,
+  now,
+  randomBytesImpl,
+}) {
+  const body = requestBody(req);
+  const environment = normalizeEnvironment(body.environment, 'Listing environment');
+  const configuration = configurationFor(environment);
+  const userId = await authenticatedUserId({ req, fetchImpl, runtime });
+  const itemId = requiredListingValue(body, 'itemId', 64);
+  const item = await getOwnedInventoryItem({
+    fetchImpl,
+    req,
+    runtime,
+    configuration,
+    userId,
+    itemId,
+  });
+  const connection = await getConnection({
+    fetchImpl,
+    req,
+    runtime,
+    configuration,
+    userId,
+  });
+  if (!connection || connection.revokedAt) {
+    throw new HttpError(404, 'Connect an eBay account before publishing a listing.');
+  }
+
+  const accessToken = await ensureEbayAccessToken({
+    fetchImpl,
+    req,
+    runtime,
+    configuration,
+    connection,
+    now,
+    randomBytesImpl,
+  });
+
+  const listingPolicies = bodyObject(body.listingPolicies);
+  const title =
+    listingString(body.title, 80) ||
+    listingString(item.title, 80) ||
+    [item.brand, item.model, item.category]
+      .map((value) => listingString(value, 80))
+      .filter(Boolean)
+      .join(' ')
+      .slice(0, 80);
+  const description =
+    listingString(body.description, 500_000) ||
+    listingString(item.description, 500_000);
+  if (!title) throw new HttpError(400, 'eBay listings need a title.');
+  if (!description) throw new HttpError(400, 'eBay listings need a description.');
+
+  const price = listingNumber(
+    body.price ??
+      (body.priceCents === undefined ? undefined : Number(body.priceCents) / 100),
+    'price',
+    { minimum: 0.01 },
+  );
+  const quantity = listingNumber(body.quantity ?? 1, 'quantity', {
+    integer: true,
+    minimum: 1,
+  });
+  const categoryId = requiredListingValue(body, 'categoryId', 20);
+  if (!/^\d+$/.test(categoryId)) {
+    throw new HttpError(400, 'eBay categoryId must be a numeric category ID.');
+  }
+
+  const marketplaceId = listingString(body.marketplaceId, 40) || 'EBAY_US';
+  const merchantLocationKey =
+    listingString(body.merchantLocationKey, 100) ||
+    requiredListingValue(listingPolicies, 'merchantLocationKey', 100);
+  const paymentPolicyId =
+    listingString(body.paymentPolicyId, 100) ||
+    requiredListingValue(listingPolicies, 'paymentPolicyId', 100);
+  const fulfillmentPolicyId =
+    listingString(body.fulfillmentPolicyId, 100) ||
+    requiredListingValue(listingPolicies, 'fulfillmentPolicyId', 100);
+  const returnPolicyId =
+    listingString(body.returnPolicyId, 100) ||
+    requiredListingValue(listingPolicies, 'returnPolicyId', 100);
+  const currency = listingString(body.currency, 3).toUpperCase() || 'USD';
+  const condition = normalizeInventoryCondition(body.condition || item.condition);
+  const conditionDescription = ['NEW', 'LIKE_NEW', 'NEW_OTHER', 'NEW_WITH_DEFECTS'].includes(condition)
+    ? ''
+    : listingString(body.conditionDescription || item.conditionNotes || item.description, 1_000);
+  const sku = listingString(body.sku, 50) || ('KF-' + itemId).slice(0, 50);
+  if (!/^[A-Za-z0-9._-]+$/.test(sku)) {
+    throw new HttpError(
+      400,
+      'eBay SKU may contain only letters, numbers, periods, underscores, and hyphens.',
+    );
+  }
+
+  const photoFileIds = await getInventoryPhotoFileIds({
+    fetchImpl,
+    req,
+    runtime,
+    configuration,
+    item,
+  });
+  const imageUrls = photoFileIds.map((fileId) =>
+    appwriteFileViewUrl(runtime, configuration, fileId),
+  );
+
+  await ebayApiRequest({
+    fetchImpl,
+    configuration,
+    accessToken,
+    method: 'PUT',
+    path: '/sell/inventory/v1/inventory_item/' + encodeURIComponent(sku),
+    body: {
+      availability: { shipToLocationAvailability: { quantity } },
+      condition,
+      ...(conditionDescription ? { conditionDescription } : {}),
+      product: { title, description, imageUrls },
+    },
+  });
+
+  const offerPayload = {
+    sku,
+    marketplaceId,
+    format: 'FIXED_PRICE',
+    availableQuantity: quantity,
+    categoryId,
+    listingDescription: description,
+    listingDuration: listingString(body.listingDuration, 30) || 'GTC',
+    merchantLocationKey,
+    pricingSummary: { price: { value: price.toFixed(2), currency } },
+    listingPolicies: { paymentPolicyId, fulfillmentPolicyId, returnPolicyId },
+  };
+  const existingOffer = await findExistingEbayOffer({
+    fetchImpl,
+    configuration,
+    accessToken,
+    sku,
+    marketplaceId,
+  });
+  let offerId = listingString(existingOffer?.offerId, 100);
+  const existingListingId = listingString(existingOffer?.listingId, 100);
+  if (String(existingOffer?.status || '').toUpperCase() === 'PUBLISHED' && existingListingId) {
+    return res.json({
+      ok: true,
+      status: 'already_published',
+      environment,
+      itemId,
+      sku,
+      offerId: offerId || null,
+      listingId: existingListingId,
+      listingUrl: listingUrl(configuration, existingListingId),
+    });
+  }
+
+  if (offerId) {
+    await ebayApiRequest({
+      fetchImpl,
+      configuration,
+      accessToken,
+      method: 'PUT',
+      path: '/sell/inventory/v1/offer/' + encodeURIComponent(offerId),
+      body: offerPayload,
+    });
+  } else {
+    const createdOffer = await ebayApiRequest({
+      fetchImpl,
+      configuration,
+      accessToken,
+      method: 'POST',
+      path: '/sell/inventory/v1/offer',
+      body: offerPayload,
+    });
+    offerId = listingString(createdOffer.payload?.offerId, 100);
+    if (!offerId) {
+      throw new HttpError(502, 'eBay created the offer but did not return an offer ID.');
+    }
+  }
+
+  const published = await ebayApiRequest({
+    fetchImpl,
+    configuration,
+    accessToken,
+    method: 'POST',
+    path: '/sell/inventory/v1/offer/' + encodeURIComponent(offerId) + '/publish',
+  });
+  const listingId = listingString(
+    published.payload?.listingId || published.payload?.listing?.listingId,
+    100,
+  );
+
+  return res.json({
+    ok: true,
+    status: 'published',
+    environment,
+    itemId,
+    sku,
+    offerId,
+    listingId: listingId || null,
+    listingUrl: listingId ? listingUrl(configuration, listingId) : null,
+  });
+}
+
 async function handleConnect({
   req,
   res,
@@ -887,12 +1444,23 @@ export function createHandler({
         return res.json({
           ok: true,
           service: 'KeepFlip eBay OAuth backend',
-          routes: ['/connect', '/status', '/refresh', '/revoke'],
+          routes: ['/connect', '/status', '/refresh', '/revoke', '/listing'],
         });
       }
 
       if (req?.method === 'POST' && path === '/connect') {
         return await handleConnect({
+          req,
+          res,
+          fetchImpl,
+          runtime,
+          now,
+          randomBytesImpl,
+        });
+      }
+
+      if (req?.method === 'POST' && path === '/listing') {
+        return await handleEbayListing({
           req,
           res,
           fetchImpl,
