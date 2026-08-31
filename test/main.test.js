@@ -5,6 +5,7 @@ import {
   __testables,
   connectionRowId,
   createHandler,
+  sellerProfileRowId,
   oauthStateRowId,
 } from '../src/main.js';
 
@@ -310,3 +311,174 @@ test('rejects app calls that do not carry an Appwrite user session', async () =>
   );
 });
 
+
+test('syncs an allowlisted seller profile and returns only safe cached listing data', async () => {
+  configureEnvironment();
+  const accessToken = 'access-token-that-must-not-leak';
+  const refreshToken = 'refresh-token-that-must-not-leak';
+  const ebayUserId = 'ebay-user-id-that-must-not-leak';
+  const privateEmail = 'seller-private@example.test';
+  const privatePhone = '+15550123';
+  const calls = [];
+  const handler = createHandler({
+    fetchImpl: async (url, options = {}) => {
+      const request = { options, url: String(url) };
+      calls.push(request);
+
+      if (request.url.endsWith('/account')) {
+        return jsonResponse(200, { $id: OWNER_ID });
+      }
+      if (
+        request.url.endsWith(
+          '/rows/' + connectionRowId(OWNER_ID, 'sandbox'),
+        ) &&
+        options.method === 'GET'
+      ) {
+        return jsonResponse(200, {
+          ownerId: OWNER_ID,
+          encryptedTokens: tokenCiphertext({
+            accessToken,
+            accessTokenExpiresAt: '2026-08-25T13:00:00.000Z',
+            refreshToken,
+            refreshTokenExpiresAt: '2027-08-25T12:00:00.000Z',
+          }),
+          revokedAt: null,
+        });
+      }
+      if (
+        request.url.endsWith(
+          '/rows/' + sellerProfileRowId(OWNER_ID, 'sandbox'),
+        ) &&
+        options.method === 'GET'
+      ) {
+        return jsonResponse(404);
+      }
+      if (
+        request.url ===
+        'https://api.sandbox.ebay.com/commerce/identity/v1/user/'
+      ) {
+        return jsonResponse(200, {
+          userId: ebayUserId,
+          username: 'keepflip.ebay',
+          accountType: 'BUSINESS',
+          accountStatus: 'CONFIRMED',
+          registrationMarketplaceId: 'EBAY_US',
+          email: privateEmail,
+          phone: privatePhone,
+          businessAccount: {
+            legalName: 'KeepFlip Resale LLC',
+            doingBusinessAs: 'KeepFlip Vintage',
+            website: 'https://keepflip.example/seller',
+            primaryPhone: privatePhone,
+          },
+        });
+      }
+      if (
+        request.url.endsWith(
+          '/rows/' + sellerProfileRowId(OWNER_ID, 'sandbox'),
+        ) &&
+        options.method === 'PATCH'
+      ) {
+        return jsonResponse(404);
+      }
+      if (
+        request.url.endsWith(
+          '/tablesdb/keepflip/tables/ebay_seller_profiles/rows',
+        ) &&
+        options.method === 'POST'
+      ) {
+        return jsonResponse(201, { $id: 'seller-profile-row' });
+      }
+      if (
+        request.url.startsWith(
+          'https://appwrite.example/v1/tablesdb/keepflip/tables/ebay_seller_listings/rows?',
+        ) &&
+        options.method === 'GET'
+      ) {
+        return jsonResponse(200, {
+          total: 1,
+          rows: [
+            {
+              ebayListingId: '123456789',
+              ebayOfferId: 'offer-123',
+              ebaySku: 'KF-123',
+              listingTitle: 'Vintage jacket',
+              listingStatus: 'PUBLISHED',
+              listingUrl: 'https://www.ebay.com/itm/123456789',
+              currentPriceCents: 5000,
+              currency: 'USD',
+              quantityAvailable: 1,
+              lastSyncedAt: NOW.toISOString(),
+              buyerEmail: privateEmail,
+            },
+          ],
+        });
+      }
+
+      throw new Error('Unexpected request: ' + request.url);
+    },
+    now: () => NOW,
+  });
+  const sink = responseSink();
+
+  await handler({
+    req: {
+      bodyJson: { environment: 'sandbox' },
+      headers: authenticatedHeaders(),
+      method: 'POST',
+      path: '/seller-account',
+    },
+    res: sink.res,
+  });
+
+  assert.equal(sink.response().statusCode, 200);
+  assert.equal(sink.response().body.connected, true);
+  assert.equal(sink.response().body.environment, 'sandbox');
+  assert.equal(sink.response().body.profileFreshness, 'current');
+  assert.deepEqual(sink.response().body.profile, {
+    username: 'keepflip.ebay',
+    accountType: 'BUSINESS',
+    accountStatus: 'CONFIRMED',
+    registrationMarketplaceId: 'EBAY_US',
+    businessName: 'KeepFlip Resale LLC',
+    doingBusinessAs: 'KeepFlip Vintage',
+    businessWebsiteUrl: 'https://keepflip.example/seller',
+    lastSyncedAt: NOW.toISOString(),
+  });
+  assert.equal(sink.response().body.listingCount, 1);
+  assert.equal(sink.response().body.listings.length, 1);
+  assert.equal(sink.response().body.listings[0].title, 'Vintage jacket');
+  assert.equal(sink.response().body.listings[0].currentPriceCents, 5000);
+  assert.equal('buyerEmail' in sink.response().body.listings[0], false);
+
+  const serial = JSON.stringify(sink.response().body);
+  assert.equal(serial.includes(accessToken), false);
+  assert.equal(serial.includes(refreshToken), false);
+  assert.equal(serial.includes(ebayUserId), false);
+  assert.equal(serial.includes(privateEmail), false);
+  assert.equal(serial.includes(privatePhone), false);
+
+  const identityRequest = calls.find(
+    (call) =>
+      call.url ===
+      'https://api.sandbox.ebay.com/commerce/identity/v1/user/',
+  );
+  assert.equal(
+    identityRequest.options.headers.Authorization,
+    'Bearer ' + accessToken,
+  );
+
+  const profileWrite = calls.find(
+    (call) =>
+      call.url.endsWith(
+        '/tablesdb/keepflip/tables/ebay_seller_profiles/rows',
+      ) && call.options.method === 'POST',
+  );
+  const profileData = JSON.parse(profileWrite.options.body).data;
+  assert.equal(profileData.ownerId, OWNER_ID);
+  assert.equal(profileData.environment, 'sandbox');
+  assert.equal(profileData.ebayUsername, 'keepflip.ebay');
+  assert.equal(profileData.ebayProfileSnapshotJson.includes(ebayUserId), false);
+  assert.equal(profileData.ebayProfileSnapshotJson.includes(privateEmail), false);
+  assert.equal(profileData.ebayProfileSnapshotJson.includes(privatePhone), false);
+});
