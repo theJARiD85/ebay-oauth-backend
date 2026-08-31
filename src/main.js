@@ -9,16 +9,18 @@ export const KEEPFLIP_EBAY_USER_SCOPES = Object.freeze([
   'https://api.ebay.com/oauth/api_scope',
   'https://api.ebay.com/oauth/api_scope/commerce.identity.readonly',
   'https://api.ebay.com/oauth/api_scope/sell.inventory',
+  'https://api.ebay.com/oauth/api_scope/sell.account.readonly',
   'https://api.ebay.com/oauth/api_scope/sell.finances',
 ]);
 
 const STATE_TTL_MS = 10 * 60 * 1000;
 
 class HttpError extends Error {
-  constructor(status, message) {
+  constructor(status, message, diagnosticCode = 'OAUTH_REQUEST_FAILED') {
     super(message);
     this.name = 'HttpError';
     this.status = status;
+    this.diagnosticCode = diagnosticCode;
   }
 }
 
@@ -30,12 +32,13 @@ class UpstreamError extends Error {
   }
 }
 
-function error(statusOrMessage, message) {
+function error(statusOrMessage, message, diagnosticCode) {
   const status = typeof statusOrMessage === 'number' ? statusOrMessage : 500;
   const detail = typeof statusOrMessage === 'number' ? message : statusOrMessage;
   throw new HttpError(
     status,
     cleanText(detail) || 'KeepFlip could not complete the eBay OAuth request.',
+    cleanText(diagnosticCode, 80) || 'OAUTH_REQUEST_FAILED',
   );
 }
 
@@ -416,6 +419,46 @@ export function sellerListingRowId(userId, environment, sourceRecordKey) {
   );
 }
 
+function sellerSetupRowId(prefix, kind, userId, environment, recordKey) {
+  return (
+    prefix +
+    createHash('sha256')
+      .update(
+        'keepflip|ebay-seller-' +
+          kind +
+          '|v1|' +
+          String(userId) +
+          ':' +
+          String(environment) +
+          ':' +
+          String(recordKey),
+        'utf8',
+      )
+      .digest('hex')
+      .slice(0, 35)
+  );
+}
+
+export function sellerBusinessPolicyRowId(
+  userId,
+  environment,
+  sourceRecordKey,
+) {
+  return sellerSetupRowId('b', 'business-policy', userId, environment, sourceRecordKey);
+}
+
+export function sellerInventoryLocationRowId(
+  userId,
+  environment,
+  merchantLocationKey,
+) {
+  return sellerSetupRowId('i', 'inventory-location', userId, environment, merchantLocationKey);
+}
+
+export function sellerListingDefaultsRowId(userId, environment, marketplaceId) {
+  return sellerSetupRowId('d', 'listing-defaults', userId, environment, marketplaceId);
+}
+
 function createOpaqueState(randomBytesImpl) {
   return randomBytesImpl(32).toString('base64url');
 }
@@ -485,8 +528,11 @@ async function getConnection({
   } catch (caught) {
     if (caught instanceof UpstreamError && caught.status === 404) return null;
     error(
-      500,
+      502,
       'KeepFlip could not read the eBay connection.',
+      caught instanceof UpstreamError
+        ? 'CONNECTION_ROW_REQUEST_' + (caught.status || 'NETWORK')
+        : 'CONNECTION_ROW_REQUEST_FAILED',
     );
   }
 }
@@ -630,6 +676,7 @@ function readTokenBundle(connection, configuration) {
     error(
       500,
       'KeepFlip could not read the stored eBay connection.',
+      'STORED_CONNECTION_UNREADABLE',
     );
   }
 
@@ -643,6 +690,7 @@ function readTokenBundle(connection, configuration) {
     error(
       500,
       'KeepFlip could not read the stored eBay connection.',
+      'STORED_CONNECTION_INVALID',
     );
   }
 
@@ -914,6 +962,34 @@ const EBAY_INVENTORY_CONDITIONS = new Set([
   'FOR_PARTS_OR_NOT_WORKING',
 ]);
 
+function normalizeInventoryCondition(value) {
+  const raw = cleanText(value, 128)
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+  const aliases = {
+    PREOWNED: 'USED_GOOD',
+    PRE_OWNED: 'USED_GOOD',
+    USED: 'USED_GOOD',
+    GOOD: 'USED_GOOD',
+    VERY_GOOD: 'USED_VERY_GOOD',
+    EXCELLENT: 'USED_EXCELLENT',
+    ACCEPTABLE: 'USED_ACCEPTABLE',
+    FOR_PARTS: 'FOR_PARTS_OR_NOT_WORKING',
+    PARTS_OR_REPAIR: 'FOR_PARTS_OR_NOT_WORKING',
+    REFURBISHED: 'SELLER_REFURBISHED',
+  };
+  const condition = aliases[raw] || raw;
+
+  if (!EBAY_INVENTORY_CONDITIONS.has(condition)) {
+    error(
+      400,
+      'Choose a supported item condition before publishing on eBay.',
+    );
+  }
+
+  return condition;
+}
 function bodyObject(value) {
   return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
 }
@@ -1389,6 +1465,695 @@ async function ebayIdentityUser({ fetchImpl, configuration, accessToken }) {
   return payload;
 }
 
+async function ebaySellerSetupRequest({
+  fetchImpl,
+  configuration,
+  accessToken,
+  path,
+}) {
+  let response;
+  try {
+    response = await fetchImpl(ebayApiBase(configuration) + path, {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json',
+        'Accept-Language': 'en-US',
+        Authorization: 'Bearer ' + accessToken,
+      },
+    });
+  } catch {
+    error(
+      502,
+      'KeepFlip could not reach eBay to read listing setup.',
+      'SELLER_SETUP_NETWORK',
+    );
+  }
+
+  const payload = await parseResponseBody(response);
+  if (!response.ok) {
+    if (response.status === 401 || response.status === 403) {
+      error(
+        401,
+        'Your eBay authorization needs to be reconnected to read listing setup.',
+        'SELLER_SETUP_RECONNECT_REQUIRED',
+      );
+    }
+    error(
+      502,
+      'KeepFlip could not read eBay listing setup.',
+      'SELLER_SETUP_HTTP_' + response.status,
+    );
+  }
+
+  return payload;
+}
+
+function safeBoolean(value) {
+  return typeof value === 'boolean' ? value : null;
+}
+
+function periodDays(value) {
+  const period = bodyObject(value);
+  const direct = safeInteger(value, 1);
+  if (direct !== null) return direct;
+
+  const unit = cleanText(period.unit, 32).toUpperCase();
+  return /DAY/.test(unit) ? safeInteger(period.value, 1) : null;
+}
+
+function policyCategoryType(policy) {
+  const categoryTypes = Array.isArray(policy?.categoryTypes)
+    ? policy.categoryTypes
+    : [];
+  const primary = categoryTypes[0];
+  return nullableText(
+    typeof primary === 'string'
+      ? primary
+      : primary?.name || primary?.categoryType,
+    96,
+  );
+}
+
+function policySummary(policyType, policyName, handlingTimeDays) {
+  if (policyType === 'fulfillment') {
+    if (handlingTimeDays !== null) {
+      return (
+        'Handling: ' +
+        handlingTimeDays +
+        ' business day' +
+        (handlingTimeDays === 1 ? '' : 's')
+      );
+    }
+    return policyName ? 'Shipping policy: ' + policyName : 'eBay shipping policy';
+  }
+
+  if (policyType === 'payment') {
+    return policyName ? 'Payment policy: ' + policyName : 'eBay payment policy';
+  }
+
+  return null;
+}
+
+function sellerBusinessPolicyRowData({
+  policy,
+  policyType,
+  userId,
+  configuration,
+  marketplaceId,
+  syncedAt,
+}) {
+  const idField =
+    policyType === 'payment'
+      ? 'paymentPolicyId'
+      : policyType === 'fulfillment'
+        ? 'fulfillmentPolicyId'
+        : 'returnPolicyId';
+  const policyId = nullableText(policy?.[idField], 100);
+  if (!policyId) return null;
+
+  const policyName = nullableText(policy?.name, 128);
+  const returnsAccepted =
+    policyType === 'return' ? safeBoolean(policy?.returnsAccepted) : null;
+  const returnPeriodDays =
+    policyType === 'return' ? periodDays(policy?.returnPeriod) : null;
+  const returnShippingCostPayer =
+    policyType === 'return'
+      ? nullableText(policy?.returnShippingCostPayer, 32)
+      : null;
+  const refundMethod =
+    policyType === 'return' ? nullableText(policy?.refundMethod, 32) : null;
+  const handlingTimeDays =
+    policyType === 'fulfillment' ? periodDays(policy?.handlingTime) : null;
+  const safeMarketplaceId =
+    nullableText(policy?.marketplaceId, 64) || marketplaceId;
+  const categoryType = policyCategoryType(policy);
+  const shippingOptionCount = Array.isArray(policy?.shippingOptions)
+    ? policy.shippingOptions.length
+    : 0;
+  const safeDetails = {
+    policyType,
+    policyId,
+    marketplaceId: safeMarketplaceId,
+    policyName,
+    categoryType,
+    returnsAccepted,
+    returnPeriodDays,
+    returnShippingCostPayer,
+    refundMethod,
+    handlingTimeDays,
+    shippingOptionCount:
+      policyType === 'fulfillment' ? shippingOptionCount : undefined,
+  };
+
+  return {
+    ownerId: userId,
+    environment: configuration.environment,
+    sourceRecordKey: policyType + ':' + policyId,
+    policyType,
+    policyId,
+    marketplaceId: safeMarketplaceId,
+    policyName,
+    categoryType,
+    returnsAccepted,
+    returnPeriodDays,
+    returnShippingCostPayer,
+    refundMethod,
+    handlingTimeDays,
+    shippingSummary:
+      policyType === 'fulfillment'
+        ? policySummary(policyType, policyName, handlingTimeDays)
+        : null,
+    paymentSummary:
+      policyType === 'payment'
+        ? policySummary(policyType, policyName, handlingTimeDays)
+        : null,
+    policyDetailsJson: JSON.stringify(safeDetails),
+    lastSyncedAt: syncedAt,
+    isArchived: false,
+  };
+}
+
+function sellerInventoryLocationRowData({
+  location,
+  userId,
+  configuration,
+  syncedAt,
+}) {
+  const merchantLocationKey = nullableText(location?.merchantLocationKey, 100);
+  if (!merchantLocationKey) return null;
+
+  const locationBody = bodyObject(location?.location);
+  const address = bodyObject(location?.address || locationBody.address);
+  const locationTypes = Array.isArray(location?.locationTypes)
+    ? location.locationTypes
+    : [];
+  const locationType = nullableText(
+    location?.locationType ||
+      locationBody.locationType ||
+      locationTypes[0],
+    64,
+  );
+  const countryCode = nullableText(
+    address.country || address.countryCode,
+    3,
+  );
+
+  return {
+    ownerId: userId,
+    environment: configuration.environment,
+    merchantLocationKey,
+    locationName: nullableText(location?.name || locationBody.name, 160),
+    locationType,
+    countryCode: countryCode ? countryCode.toUpperCase() : null,
+    locationStatus: nullableText(
+      location?.merchantLocationStatus || location?.status,
+      64,
+    ),
+    lastSyncedAt: syncedAt,
+    isArchived: false,
+  };
+}
+
+function policyRowsFromEbayPayload({
+  payload,
+  policyType,
+  userId,
+  configuration,
+  marketplaceId,
+  syncedAt,
+}) {
+  const listKey =
+    policyType === 'payment'
+      ? 'paymentPolicies'
+      : policyType === 'fulfillment'
+        ? 'fulfillmentPolicies'
+        : 'returnPolicies';
+  const policies = Array.isArray(payload?.[listKey]) ? payload[listKey] : [];
+  const seen = new Set();
+  const rows = [];
+
+  for (const policy of policies) {
+    const row = sellerBusinessPolicyRowData({
+      policy,
+      policyType,
+      userId,
+      configuration,
+      marketplaceId,
+      syncedAt,
+    });
+    if (!row || seen.has(row.sourceRecordKey)) continue;
+    seen.add(row.sourceRecordKey);
+    rows.push(row);
+  }
+
+  return rows;
+}
+
+function locationRowsFromEbayPayload({
+  payload,
+  userId,
+  configuration,
+  syncedAt,
+}) {
+  const locations = Array.isArray(payload?.locations) ? payload.locations : [];
+  const seen = new Set();
+  const rows = [];
+
+  for (const location of locations) {
+    const row = sellerInventoryLocationRowData({
+      location,
+      userId,
+      configuration,
+      syncedAt,
+    });
+    if (!row || seen.has(row.merchantLocationKey)) continue;
+    seen.add(row.merchantLocationKey);
+    rows.push(row);
+  }
+
+  return rows;
+}
+
+async function listEbayInventoryLocations({
+  fetchImpl,
+  configuration,
+  accessToken,
+}) {
+  const limit = 100;
+  const maximumPages = 5;
+  const locations = [];
+
+  for (let page = 0; page < maximumPages; page += 1) {
+    const query = new URLSearchParams({
+      limit: String(limit),
+      offset: String(page * limit),
+    });
+    const payload = await ebaySellerSetupRequest({
+      fetchImpl,
+      configuration,
+      accessToken,
+      path: '/sell/inventory/v1/location?' + query.toString(),
+    });
+    const batch = Array.isArray(payload?.locations) ? payload.locations : [];
+    locations.push(...batch);
+
+    const total = safeInteger(payload?.total, 0);
+    if (
+      batch.length === 0 ||
+      batch.length < limit ||
+      (total !== null && locations.length >= total)
+    ) {
+      break;
+    }
+  }
+
+  return { locations };
+}
+
+function policyRowsForType(rows, policyType) {
+  return rows.filter((row) => row.policyType === policyType);
+}
+
+function onlyPolicyId(rows, policyType) {
+  const ids = [
+    ...new Set(
+      policyRowsForType(rows, policyType)
+        .map((row) => nullableText(row.policyId, 100))
+        .filter(Boolean),
+    ),
+  ];
+  return ids.length === 1 ? ids[0] : null;
+}
+
+function onlyMerchantLocationKey(rows) {
+  const keys = [
+    ...new Set(
+      rows
+        .map((row) => nullableText(row.merchantLocationKey, 100))
+        .filter(Boolean),
+    ),
+  ];
+  return keys.length === 1 ? keys[0] : null;
+}
+
+function marketplaceCurrency(marketplaceId) {
+  const currencies = {
+    EBAY_US: 'USD',
+    EBAY_CA: 'CAD',
+    EBAY_GB: 'GBP',
+    EBAY_AU: 'AUD',
+    EBAY_DE: 'EUR',
+    EBAY_ES: 'EUR',
+    EBAY_FR: 'EUR',
+    EBAY_IE: 'EUR',
+    EBAY_IT: 'EUR',
+    EBAY_NL: 'EUR',
+  };
+  return currencies[marketplaceId] || null;
+}
+
+function sellerListingDefaultsData({
+  userId,
+  configuration,
+  marketplaceId,
+  policyRows,
+  locationRows,
+  syncedAt,
+}) {
+  const currency = marketplaceCurrency(marketplaceId);
+  if (!currency) return null;
+
+  return {
+    ownerId: userId,
+    environment: configuration.environment,
+    marketplaceId,
+    defaultMerchantLocationKey: onlyMerchantLocationKey(locationRows),
+    defaultPaymentPolicyId: onlyPolicyId(policyRows, 'payment'),
+    defaultFulfillmentPolicyId: onlyPolicyId(policyRows, 'fulfillment'),
+    defaultReturnPolicyId: onlyPolicyId(policyRows, 'return'),
+    defaultListingDuration: 'GTC',
+    defaultFormat: 'FIXED_PRICE',
+    defaultCurrency: currency,
+    defaultQuantity: 1,
+    defaultCategoryId: null,
+    defaultCondition: null,
+    defaultStoreCategoryId: null,
+    selectionSource: 'ebay_import',
+    updatedAt: syncedAt,
+  };
+}
+
+function selectedPolicyExists(defaults, field, rows, policyType) {
+  const selected = nullableText(defaults?.[field], 100);
+  return Boolean(
+    selected &&
+      policyRowsForType(rows, policyType).some(
+        (row) => nullableText(row.policyId, 100) === selected,
+      ),
+  );
+}
+
+function selectedLocationExists(defaults, locationRows) {
+  const selected = nullableText(defaults?.defaultMerchantLocationKey, 100);
+  return Boolean(
+    selected &&
+      locationRows.some(
+        (row) => nullableText(row.merchantLocationKey, 100) === selected,
+      ),
+  );
+}
+
+function listingSetupMessage(issueCode) {
+  const messages = {
+    MISSING_PAYMENT_POLICY:
+      'Add a payment policy in eBay, then refresh KeepFlip.',
+    MISSING_FULFILLMENT_POLICY:
+      'Add a shipping policy in eBay, then refresh KeepFlip.',
+    MISSING_RETURN_POLICY:
+      'Add a return policy in eBay, then refresh KeepFlip.',
+    MISSING_INVENTORY_LOCATION:
+      'Add an inventory location in eBay, then refresh KeepFlip.',
+    CHOOSE_LISTING_DEFAULTS:
+      'Choose which saved eBay policies and location KeepFlip should use by default.',
+    UNSUPPORTED_MARKETPLACE:
+      'Choose a supported marketplace before saving listing defaults.',
+    RECONNECT_REQUIRED:
+      'Reconnect eBay to let KeepFlip read your listing setup.',
+    SETUP_SYNC_FAILED:
+      'KeepFlip could not refresh listing setup right now. Try again shortly.',
+  };
+  return messages[issueCode] || null;
+}
+
+function sellerListingSetupForApp({
+  marketplaceId,
+  policyRows,
+  locationRows,
+  defaults,
+  checkedAt,
+  overrideIssueCode = null,
+}) {
+  const policyCounts = {
+    payment: policyRowsForType(policyRows, 'payment').length,
+    fulfillment: policyRowsForType(policyRows, 'fulfillment').length,
+    return: policyRowsForType(policyRows, 'return').length,
+  };
+  const defaultSelection = {
+    hasMerchantLocation: selectedLocationExists(defaults, locationRows),
+    hasPaymentPolicy: selectedPolicyExists(
+      defaults,
+      'defaultPaymentPolicyId',
+      policyRows,
+      'payment',
+    ),
+    hasFulfillmentPolicy: selectedPolicyExists(
+      defaults,
+      'defaultFulfillmentPolicyId',
+      policyRows,
+      'fulfillment',
+    ),
+    hasReturnPolicy: selectedPolicyExists(
+      defaults,
+      'defaultReturnPolicyId',
+      policyRows,
+      'return',
+    ),
+  };
+  let issueCode = overrideIssueCode;
+  if (!issueCode && policyCounts.payment === 0) {
+    issueCode = 'MISSING_PAYMENT_POLICY';
+  } else if (!issueCode && policyCounts.fulfillment === 0) {
+    issueCode = 'MISSING_FULFILLMENT_POLICY';
+  } else if (!issueCode && policyCounts.return === 0) {
+    issueCode = 'MISSING_RETURN_POLICY';
+  } else if (!issueCode && locationRows.length === 0) {
+    issueCode = 'MISSING_INVENTORY_LOCATION';
+  } else if (!issueCode && !marketplaceCurrency(marketplaceId)) {
+    issueCode = 'UNSUPPORTED_MARKETPLACE';
+  } else if (
+    !issueCode &&
+    Object.values(defaultSelection).some((selected) => !selected)
+  ) {
+    issueCode = 'CHOOSE_LISTING_DEFAULTS';
+  }
+
+  const state =
+    issueCode === 'SETUP_SYNC_FAILED'
+      ? 'failed'
+      : issueCode
+        ? 'needs_setup'
+        : 'ready';
+
+  return {
+    state,
+    marketplaceId,
+    policyCounts,
+    locationCount: locationRows.length,
+    defaultSelection,
+    lastCheckedAt: checkedAt,
+    ...(issueCode ? { issueCode, message: listingSetupMessage(issueCode) } : {}),
+  };
+}
+
+function sellerListingSetupFailureForApp({ marketplaceId, now, caught }) {
+  const issueCode =
+    caught instanceof HttpError && caught.status === 401
+      ? 'RECONNECT_REQUIRED'
+      : 'SETUP_SYNC_FAILED';
+  return sellerListingSetupForApp({
+    marketplaceId,
+    policyRows: [],
+    locationRows: [],
+    defaults: null,
+    checkedAt: currentDate(now).toISOString(),
+    overrideIssueCode: issueCode,
+  });
+}
+
+async function readSellerListingDefaults({
+  fetchImpl,
+  req,
+  runtime,
+  configuration,
+  userId,
+  marketplaceId,
+}) {
+  const defaults = await getServerRowOrNull({
+    fetchImpl,
+    req,
+    runtime,
+    configuration,
+    tableId: configuration.sellerListingDefaultsTableId,
+    rowId: sellerListingDefaultsRowId(
+      userId,
+      configuration.environment,
+      marketplaceId,
+    ),
+    failureMessage: 'KeepFlip could not read saved listing defaults.',
+  });
+
+  if (
+    !defaults ||
+    defaults.ownerId !== userId ||
+    (defaults.environment &&
+      defaults.environment !== configuration.environment) ||
+    (defaults.marketplaceId && defaults.marketplaceId !== marketplaceId)
+  ) {
+    return null;
+  }
+
+  return defaults;
+}
+
+async function syncSellerListingSetup({
+  fetchImpl,
+  req,
+  runtime,
+  configuration,
+  userId,
+  accessToken,
+  marketplaceId,
+  now,
+}) {
+  const query = new URLSearchParams({ marketplace_id: marketplaceId });
+  const [paymentPayload, fulfillmentPayload, returnPayload, locationsPayload] =
+    await Promise.all([
+      ebaySellerSetupRequest({
+        fetchImpl,
+        configuration,
+        accessToken,
+        path: '/sell/account/v1/payment_policy?' + query.toString(),
+      }),
+      ebaySellerSetupRequest({
+        fetchImpl,
+        configuration,
+        accessToken,
+        path: '/sell/account/v1/fulfillment_policy?' + query.toString(),
+      }),
+      ebaySellerSetupRequest({
+        fetchImpl,
+        configuration,
+        accessToken,
+        path: '/sell/account/v1/return_policy?' + query.toString(),
+      }),
+      listEbayInventoryLocations({
+        fetchImpl,
+        configuration,
+        accessToken,
+      }),
+    ]);
+  const syncedAt = currentDate(now).toISOString();
+  const policyRows = [
+    ...policyRowsFromEbayPayload({
+      payload: paymentPayload,
+      policyType: 'payment',
+      userId,
+      configuration,
+      marketplaceId,
+      syncedAt,
+    }),
+    ...policyRowsFromEbayPayload({
+      payload: fulfillmentPayload,
+      policyType: 'fulfillment',
+      userId,
+      configuration,
+      marketplaceId,
+      syncedAt,
+    }),
+    ...policyRowsFromEbayPayload({
+      payload: returnPayload,
+      policyType: 'return',
+      userId,
+      configuration,
+      marketplaceId,
+      syncedAt,
+    }),
+  ];
+  const locationRows = locationRowsFromEbayPayload({
+    payload: locationsPayload,
+    userId,
+    configuration,
+    syncedAt,
+  });
+
+  for (const row of policyRows) {
+    await upsertServerRow({
+      fetchImpl,
+      req,
+      runtime,
+      configuration,
+      tableId: configuration.sellerBusinessPoliciesTableId,
+      rowId: sellerBusinessPolicyRowId(
+        userId,
+        configuration.environment,
+        row.sourceRecordKey,
+      ),
+      data: row,
+      failureMessage: 'KeepFlip could not save an eBay business policy.',
+    });
+  }
+
+  for (const row of locationRows) {
+    await upsertServerRow({
+      fetchImpl,
+      req,
+      runtime,
+      configuration,
+      tableId: configuration.sellerInventoryLocationsTableId,
+      rowId: sellerInventoryLocationRowId(
+        userId,
+        configuration.environment,
+        row.merchantLocationKey,
+      ),
+      data: row,
+      failureMessage: 'KeepFlip could not save an eBay inventory location.',
+    });
+  }
+
+  let defaults = await readSellerListingDefaults({
+    fetchImpl,
+    req,
+    runtime,
+    configuration,
+    userId,
+    marketplaceId,
+  });
+  if (!defaults) {
+    const data = sellerListingDefaultsData({
+      userId,
+      configuration,
+      marketplaceId,
+      policyRows,
+      locationRows,
+      syncedAt,
+    });
+    if (data) {
+      await upsertServerRow({
+        fetchImpl,
+        req,
+        runtime,
+        configuration,
+        tableId: configuration.sellerListingDefaultsTableId,
+        rowId: sellerListingDefaultsRowId(
+          userId,
+          configuration.environment,
+          marketplaceId,
+        ),
+        data,
+        failureMessage: 'KeepFlip could not save listing defaults.',
+      });
+      defaults = data;
+    }
+  }
+
+  return sellerListingSetupForApp({
+    marketplaceId,
+    policyRows,
+    locationRows,
+    defaults,
+    checkedAt: syncedAt,
+  });
+}
 async function readCachedSellerProfile({
   fetchImpl,
   req,
@@ -1547,7 +2312,10 @@ async function handleSellerAccount({
   now,
   randomBytesImpl,
 }) {
-  const environment = normalizeEnvironment(requestBody(req).environment);
+  const body = requestBody(req);
+  const environment = normalizeEnvironment(body.environment);
+  const marketplaceId =
+    listingString(body.marketplaceId, 64).toUpperCase() || 'EBAY_US';
   const configuration = configurationFor(environment);
   const userId = await authenticatedUserId({ req, fetchImpl, runtime });
   const connection = await getConnection({
@@ -1582,6 +2350,7 @@ async function handleSellerAccount({
   });
   let sellerProfile = cachedProfile;
   let profileFreshness = cachedProfile ? 'stale' : undefined;
+  let listingSetup;
 
   try {
     const accessToken = await ensureEbayAccessToken({
@@ -1618,6 +2387,50 @@ async function handleSellerAccount({
     });
     sellerProfile = { ...cachedProfile, ...data };
     profileFreshness = 'current';
+
+    try {
+      listingSetup = await syncSellerListingSetup({
+        fetchImpl,
+        req,
+        runtime,
+        configuration,
+        userId,
+        accessToken,
+        marketplaceId,
+        now,
+      });
+    } catch (caught) {
+      // The profile is still useful if eBay policy reads are temporarily
+      // unavailable or the seller has not granted the new Account-read scope.
+      listingSetup = sellerListingSetupFailureForApp({
+        marketplaceId,
+        now,
+        caught,
+      });
+    }
+
+    const profileWithListingSetup = {
+      ...data,
+      listingSetupState: listingSetup.state,
+      listingSetupLastCheckedAt: listingSetup.lastCheckedAt,
+      listingSetupIssueCode: listingSetup.issueCode || null,
+    };
+    try {
+      await upsertServerRow({
+        fetchImpl,
+        req,
+        runtime,
+        configuration,
+        tableId: configuration.sellerProfilesTableId,
+        rowId: sellerProfileRowId(userId, environment),
+        data: profileWithListingSetup,
+        failureMessage: 'KeepFlip could not save seller listing setup status.',
+      });
+      sellerProfile = { ...cachedProfile, ...profileWithListingSetup };
+    } catch {
+      // The identity profile was already saved above. Do not replace it with a
+      // generic screen error solely because its optional setup status failed.
+    }
   } catch (caught) {
     if (caught instanceof HttpError && caught.status === 401) {
       throw caught;
@@ -1643,10 +2456,10 @@ async function handleSellerAccount({
     environment,
     ...(profile ? { profile } : {}),
     ...(profileFreshness ? { profileFreshness } : {}),
+    ...(listingSetup ? { listingSetup } : {}),
     ...cachedListings,
   });
 }
-
 async function handleEbayListing({
   req,
   res,
@@ -1690,6 +2503,22 @@ async function handleEbayListing({
   });
 
   const listingPolicies = bodyObject(body.listingPolicies);
+  const marketplaceId =
+    listingString(body.marketplaceId, 40).toUpperCase() || 'EBAY_US';
+  let savedListingDefaults = null;
+  try {
+    savedListingDefaults = await readSellerListingDefaults({
+      fetchImpl,
+      req,
+      runtime,
+      configuration,
+      userId,
+      marketplaceId,
+    });
+  } catch {
+    // A saved preset is optional. Explicit listing-policy values still work
+    // when its cache is temporarily unavailable.
+  }
   const title =
     listingString(body.title, 80) ||
     listingString(item.title, 80) ||
@@ -1710,29 +2539,68 @@ async function handleEbayListing({
     'price',
     { minimum: 0.01 },
   );
-  const quantity = listingNumber(body.quantity ?? 1, 'quantity', {
-    integer: true,
-    minimum: 1,
-  });
-  const categoryId = requiredListingValue(body, 'categoryId', 20);
+  const quantity = listingNumber(
+    body.quantity ?? savedListingDefaults?.defaultQuantity ?? 1,
+    'quantity',
+    {
+      integer: true,
+      minimum: 1,
+    },
+  );
+  const categoryId =
+    listingString(body.categoryId, 20) ||
+    listingString(savedListingDefaults?.defaultCategoryId, 20);
+  if (!categoryId) {
+    error(400, 'eBay listing field "categoryId" is required.');
+  }
   if (!/^\d+$/.test(categoryId)) {
     error(400, 'eBay categoryId must be a numeric category ID.');
   }
 
-  const marketplaceId = listingString(body.marketplaceId, 40) || 'EBAY_US';
   const merchantLocationKey =
     listingString(body.merchantLocationKey, 100) ||
-    requiredListingValue(listingPolicies, 'merchantLocationKey', 100);
+    listingString(listingPolicies.merchantLocationKey, 100) ||
+    listingString(savedListingDefaults?.defaultMerchantLocationKey, 100);
+  if (!merchantLocationKey) {
+    error(
+      400,
+      'Finish your saved eBay listing setup in Seller Account, then try again.',
+    );
+  }
   const paymentPolicyId =
     listingString(body.paymentPolicyId, 100) ||
-    requiredListingValue(listingPolicies, 'paymentPolicyId', 100);
+    listingString(listingPolicies.paymentPolicyId, 100) ||
+    listingString(savedListingDefaults?.defaultPaymentPolicyId, 100);
+  if (!paymentPolicyId) {
+    error(
+      400,
+      'Finish your saved eBay listing setup in Seller Account, then try again.',
+    );
+  }
   const fulfillmentPolicyId =
     listingString(body.fulfillmentPolicyId, 100) ||
-    requiredListingValue(listingPolicies, 'fulfillmentPolicyId', 100);
+    listingString(listingPolicies.fulfillmentPolicyId, 100) ||
+    listingString(savedListingDefaults?.defaultFulfillmentPolicyId, 100);
+  if (!fulfillmentPolicyId) {
+    error(
+      400,
+      'Finish your saved eBay listing setup in Seller Account, then try again.',
+    );
+  }
   const returnPolicyId =
     listingString(body.returnPolicyId, 100) ||
-    requiredListingValue(listingPolicies, 'returnPolicyId', 100);
-  const currency = listingString(body.currency, 3).toUpperCase() || 'USD';
+    listingString(listingPolicies.returnPolicyId, 100) ||
+    listingString(savedListingDefaults?.defaultReturnPolicyId, 100);
+  if (!returnPolicyId) {
+    error(
+      400,
+      'Finish your saved eBay listing setup in Seller Account, then try again.',
+    );
+  }
+  const currency =
+    listingString(body.currency, 3).toUpperCase() ||
+    listingString(savedListingDefaults?.defaultCurrency, 3).toUpperCase() ||
+    'USD';
   const condition = normalizeInventoryCondition(body.condition || item.condition);
   const conditionDescription = ['NEW', 'LIKE_NEW', 'NEW_OTHER', 'NEW_WITH_DEFECTS'].includes(condition)
     ? ''
@@ -1777,7 +2645,10 @@ async function handleEbayListing({
     availableQuantity: quantity,
     categoryId,
     listingDescription: description,
-    listingDuration: listingString(body.listingDuration, 30) || 'GTC',
+    listingDuration:
+      listingString(body.listingDuration, 30) ||
+      listingString(savedListingDefaults?.defaultListingDuration, 30) ||
+      'GTC',
     merchantLocationKey,
     pricingSummary: { price: { value: price.toFixed(2), currency } },
     listingPolicies: { paymentPolicyId, fulfillmentPolicyId, returnPolicyId },
@@ -1941,7 +2812,7 @@ async function handleConnect({
   });
 }
 
-async function handleStatus({ req, res, fetchImpl, runtime, now }) {
+async function handleStatus({ req, res, fetchImpl, runtime, now, error: reportError }) {
   const environment = normalizeEnvironment(requestBody(req).environment);
   const configuration = configurationFor(environment);
   const userId = await authenticatedUserId({ req, fetchImpl, runtime });
@@ -1957,14 +2828,30 @@ async function handleStatus({ req, res, fetchImpl, runtime, now }) {
     return res.json({ connected: false, environment });
   }
 
-  return res.json(
-    connectionStatus(
-      connection,
-      readTokenBundle(connection, configuration),
-      configuration,
-      now,
-    ),
-  );
+  try {
+    return res.json(
+      connectionStatus(
+        connection,
+        readTokenBundle(connection, configuration),
+        configuration,
+        now,
+      ),
+    );
+  } catch (caught) {
+    if (
+      caught instanceof HttpError &&
+      (caught.diagnosticCode === 'STORED_CONNECTION_UNREADABLE' ||
+        caught.diagnosticCode === 'STORED_CONNECTION_INVALID')
+    ) {
+      safeError(reportError, caught, '/status');
+      return res.json({
+        connected: false,
+        environment,
+        needsReconnect: true,
+      });
+    }
+    throw caught;
+  }
 }
 
 async function handleRefresh({
@@ -2059,9 +2946,31 @@ async function handleRevoke({ req, res, fetchImpl, runtime, now }) {
   });
 }
 
-function safeError(error) {
+function safeError(error, caught, path = '') {
   if (typeof error === 'function') {
-    error('KeepFlip eBay OAuth backend request failed.');
+    const route = cleanText(path, 80) || 'unknown';
+    const code =
+      caught instanceof HttpError
+        ? cleanText(caught.diagnosticCode, 80) || 'HTTP_' + caught.status
+        : caught instanceof UpstreamError
+          ? 'UPSTREAM_' + (caught.status || 'NETWORK')
+          : ['TypeError', 'ReferenceError', 'SyntaxError', 'RangeError'].includes(
+                cleanText(caught?.name, 32),
+              )
+            ? 'UNEXPECTED_' + cleanText(caught?.name, 32).toUpperCase()
+            : 'UNEXPECTED';
+    const status =
+      caught instanceof HttpError || caught instanceof UpstreamError
+        ? String(caught.status || 500)
+        : '500';
+    error(
+      'KeepFlip eBay OAuth backend request failed. route=' +
+        route +
+        ' status=' +
+        status +
+        ' reason=' +
+        code,
+    );
   }
 }
 
@@ -2075,8 +2984,9 @@ export function createHandler({
   }
 
   return async function main({ req, res, error } = {}) {
+    let path = 'unknown';
     try {
-      const path = requestPath(req);
+      path = requestPath(req);
       const runtime = functionRuntime();
 
       if (req?.method === 'GET' && path === '/') {
@@ -2128,7 +3038,14 @@ export function createHandler({
       }
 
       if (req?.method === 'POST' && path === '/status') {
-        return await handleStatus({ req, res, fetchImpl, runtime, now });
+        return await handleStatus({
+          req,
+          res,
+          fetchImpl,
+          runtime,
+          now,
+          error,
+        });
       }
 
       if (req?.method === 'POST' && path === '/revoke') {
@@ -2149,7 +3066,7 @@ export function createHandler({
       return res.json({ error: 'Endpoint not found.' }, 404);
     } catch (caught) {
       const status = caught instanceof HttpError ? caught.status : 500;
-      if (status >= 500) safeError(error);
+      if (status >= 500) safeError(error, caught, path);
 
       return res.json(
         {

@@ -5,6 +5,9 @@ import {
   __testables,
   connectionRowId,
   createHandler,
+  sellerBusinessPolicyRowId,
+  sellerInventoryLocationRowId,
+  sellerListingDefaultsRowId,
   sellerProfileRowId,
   oauthStateRowId,
 } from '../src/main.js';
@@ -182,6 +185,58 @@ test('returns only safe connection status for an authenticated user', async () =
   });
   assert.equal(JSON.stringify(sink.response().body).includes(accessToken), false);
   assert.equal(JSON.stringify(sink.response().body).includes(refreshToken), false);
+});
+
+test('returns a reconnect state when a saved connection cannot be decrypted', async () => {
+  configureEnvironment();
+  const logs = [];
+  const handler = createHandler({
+    fetchImpl: async (url) => {
+      const requestUrl = String(url);
+      if (requestUrl.endsWith('/account')) {
+        return jsonResponse(200, { $id: OWNER_ID });
+      }
+      if (
+        requestUrl.endsWith(
+          '/rows/' + connectionRowId(OWNER_ID, 'sandbox'),
+        )
+      ) {
+        return jsonResponse(200, {
+          ownerId: OWNER_ID,
+          encryptedTokens: 'v1.not-a-valid-encrypted-token',
+          revokedAt: null,
+        });
+      }
+
+      throw new Error('Unexpected request: ' + requestUrl);
+    },
+    now: () => NOW,
+  });
+  const sink = responseSink();
+
+  await handler({
+    req: {
+      bodyJson: { environment: 'sandbox' },
+      headers: authenticatedHeaders(),
+      method: 'POST',
+      path: '/status',
+    },
+    res: sink.res,
+    error: (message) => logs.push(message),
+  });
+
+  assert.deepEqual(sink.response(), {
+    body: {
+      connected: false,
+      environment: 'sandbox',
+      needsReconnect: true,
+    },
+    kind: 'json',
+    statusCode: 200,
+  });
+  assert.deepEqual(logs, [
+    'KeepFlip eBay OAuth backend request failed. route=/status status=500 reason=STORED_CONNECTION_UNREADABLE',
+  ]);
 });
 
 test('refreshes the stored token without exposing it to the app', async () => {
@@ -481,4 +536,496 @@ test('syncs an allowlisted seller profile and returns only safe cached listing d
   assert.equal(profileData.ebayProfileSnapshotJson.includes(ebayUserId), false);
   assert.equal(profileData.ebayProfileSnapshotJson.includes(privateEmail), false);
   assert.equal(profileData.ebayProfileSnapshotJson.includes(privatePhone), false);
+});
+test('syncs safe eBay policies, locations, and unambiguous listing defaults', async () => {
+  configureEnvironment();
+  const accessToken = 'access-token-that-must-not-leak';
+  const refreshToken = 'refresh-token-that-must-not-leak';
+  const privateEmail = 'private-seller@example.test';
+  const privateAddress = '123 Private Warehouse Lane';
+  const calls = [];
+  const handler = createHandler({
+    fetchImpl: async (url, options = {}) => {
+      const request = { options, url: String(url) };
+      calls.push(request);
+
+      if (request.url.endsWith('/account')) {
+        return jsonResponse(200, { $id: OWNER_ID });
+      }
+      if (
+        request.url.endsWith(
+          '/rows/' + connectionRowId(OWNER_ID, 'sandbox'),
+        ) &&
+        options.method === 'GET'
+      ) {
+        return jsonResponse(200, {
+          ownerId: OWNER_ID,
+          encryptedTokens: tokenCiphertext({
+            accessToken,
+            accessTokenExpiresAt: '2026-08-25T13:00:00.000Z',
+            refreshToken,
+            refreshTokenExpiresAt: '2027-08-25T12:00:00.000Z',
+          }),
+          revokedAt: null,
+        });
+      }
+      if (
+        request.url.endsWith(
+          '/rows/' + sellerProfileRowId(OWNER_ID, 'sandbox'),
+        ) &&
+        options.method === 'GET'
+      ) {
+        return jsonResponse(404);
+      }
+      if (
+        request.url ===
+        'https://api.sandbox.ebay.com/commerce/identity/v1/user/'
+      ) {
+        return jsonResponse(200, {
+          userId: 'raw-ebay-user-id-must-not-persist',
+          username: 'keepflip.ebay',
+          accountType: 'BUSINESS',
+          accountStatus: 'CONFIRMED',
+          registrationMarketplaceId: 'EBAY_US',
+          email: privateEmail,
+        });
+      }
+      if (
+        request.url ===
+        'https://api.sandbox.ebay.com/sell/account/v1/payment_policy?marketplace_id=EBAY_US'
+      ) {
+        return jsonResponse(200, {
+          paymentPolicies: [
+            {
+              paymentPolicyId: 'payment-policy-one',
+              marketplaceId: 'EBAY_US',
+              name: 'Standard payments',
+              categoryTypes: ['ALL_EXCLUDING_MOTORS_VEHICLES'],
+              privatePaymentInstructions: 'Never store this text.',
+            },
+          ],
+        });
+      }
+      if (
+        request.url ===
+        'https://api.sandbox.ebay.com/sell/account/v1/fulfillment_policy?marketplace_id=EBAY_US'
+      ) {
+        return jsonResponse(200, {
+          fulfillmentPolicies: [
+            {
+              fulfillmentPolicyId: 'fulfillment-policy-one',
+              marketplaceId: 'EBAY_US',
+              name: 'One-day handling',
+              handlingTime: { value: 1, unit: 'DAY' },
+              shippingOptions: [
+                {
+                  shippingServiceCode: 'USPSPriority',
+                  privateCarrierAccount: 'do-not-store',
+                },
+              ],
+            },
+          ],
+        });
+      }
+      if (
+        request.url ===
+        'https://api.sandbox.ebay.com/sell/account/v1/return_policy?marketplace_id=EBAY_US'
+      ) {
+        return jsonResponse(200, {
+          returnPolicies: [
+            {
+              returnPolicyId: 'return-policy-one',
+              marketplaceId: 'EBAY_US',
+              name: 'Thirty-day returns',
+              returnsAccepted: true,
+              returnPeriod: { value: 30, unit: 'DAY' },
+              returnShippingCostPayer: 'BUYER',
+              refundMethod: 'MONEY_BACK',
+            },
+          ],
+        });
+      }
+      if (
+        request.url ===
+        'https://api.sandbox.ebay.com/sell/inventory/v1/location?limit=100&offset=0'
+      ) {
+        return jsonResponse(200, {
+          total: 1,
+          locations: [
+            {
+              merchantLocationKey: 'warehouse-main',
+              name: 'Main inventory',
+              merchantLocationStatus: 'ENABLED',
+              locationTypes: ['WAREHOUSE'],
+              address: {
+                addressLine1: privateAddress,
+                city: 'Portland',
+                country: 'US',
+                postalCode: '97205',
+              },
+            },
+          ],
+        });
+      }
+      if (
+        request.url.endsWith(
+          '/rows/' + sellerListingDefaultsRowId(OWNER_ID, 'sandbox', 'EBAY_US'),
+        ) &&
+        options.method === 'GET'
+      ) {
+        return jsonResponse(404);
+      }
+      if (
+        request.url.endsWith('/rows/' + sellerProfileRowId(OWNER_ID, 'sandbox')) ||
+        request.url.endsWith(
+          '/rows/' +
+            sellerBusinessPolicyRowId(
+              OWNER_ID,
+              'sandbox',
+              'payment:payment-policy-one',
+            ),
+        ) ||
+        request.url.endsWith(
+          '/rows/' +
+            sellerBusinessPolicyRowId(
+              OWNER_ID,
+              'sandbox',
+              'fulfillment:fulfillment-policy-one',
+            ),
+        ) ||
+        request.url.endsWith(
+          '/rows/' +
+            sellerBusinessPolicyRowId(
+              OWNER_ID,
+              'sandbox',
+              'return:return-policy-one',
+            ),
+        ) ||
+        request.url.endsWith(
+          '/rows/' +
+            sellerInventoryLocationRowId(
+              OWNER_ID,
+              'sandbox',
+              'warehouse-main',
+            ),
+        ) ||
+        request.url.endsWith(
+          '/rows/' + sellerListingDefaultsRowId(OWNER_ID, 'sandbox', 'EBAY_US'),
+        )
+      ) {
+        if (options.method === 'PATCH') return jsonResponse(404);
+      }
+      if (
+        request.url.endsWith(
+          '/tablesdb/keepflip/tables/ebay_seller_profiles/rows',
+        ) ||
+        request.url.endsWith(
+          '/tablesdb/keepflip/tables/ebay_seller_business_policies/rows',
+        ) ||
+        request.url.endsWith(
+          '/tablesdb/keepflip/tables/ebay_seller_inventory_locations/rows',
+        ) ||
+        request.url.endsWith(
+          '/tablesdb/keepflip/tables/ebay_seller_listing_defaults/rows',
+        )
+      ) {
+        if (options.method === 'POST') return jsonResponse(201, { $id: 'saved-row' });
+      }
+      if (
+        request.url.startsWith(
+          'https://appwrite.example/v1/tablesdb/keepflip/tables/ebay_seller_listings/rows?',
+        ) &&
+        options.method === 'GET'
+      ) {
+        return jsonResponse(200, { total: 0, rows: [] });
+      }
+
+      throw new Error('Unexpected request: ' + request.url);
+    },
+    now: () => NOW,
+  });
+  const sink = responseSink();
+
+  await handler({
+    req: {
+      bodyJson: { environment: 'sandbox' },
+      headers: authenticatedHeaders(),
+      method: 'POST',
+      path: '/seller-account',
+    },
+    res: sink.res,
+  });
+
+  assert.equal(sink.response().statusCode, 200);
+  assert.deepEqual(sink.response().body.listingSetup, {
+    state: 'ready',
+    marketplaceId: 'EBAY_US',
+    policyCounts: { payment: 1, fulfillment: 1, return: 1 },
+    locationCount: 1,
+    defaultSelection: {
+      hasMerchantLocation: true,
+      hasPaymentPolicy: true,
+      hasFulfillmentPolicy: true,
+      hasReturnPolicy: true,
+    },
+    lastCheckedAt: NOW.toISOString(),
+  });
+
+  const policyWrites = calls
+    .filter(
+      (call) =>
+        call.options.method === 'POST' &&
+        call.url.endsWith(
+          '/tablesdb/keepflip/tables/ebay_seller_business_policies/rows',
+        ),
+    )
+    .map((call) => JSON.parse(call.options.body).data);
+  assert.equal(policyWrites.length, 3);
+  assert.equal(
+    policyWrites.some(
+      (row) =>
+        row.policyId === 'fulfillment-policy-one' &&
+        row.handlingTimeDays === 1 &&
+        row.shippingSummary === 'Handling: 1 business day',
+    ),
+    true,
+  );
+  assert.equal(
+    policyWrites.some(
+      (row) =>
+        row.policyId === 'return-policy-one' &&
+        row.returnsAccepted === true &&
+        row.returnPeriodDays === 30,
+    ),
+    true,
+  );
+
+  const locationWrite = calls.find(
+    (call) =>
+      call.options.method === 'POST' &&
+      call.url.endsWith(
+        '/tablesdb/keepflip/tables/ebay_seller_inventory_locations/rows',
+      ),
+  );
+  const locationData = JSON.parse(locationWrite.options.body).data;
+  assert.deepEqual(locationData, {
+    ownerId: OWNER_ID,
+    environment: 'sandbox',
+    merchantLocationKey: 'warehouse-main',
+    locationName: 'Main inventory',
+    locationType: 'WAREHOUSE',
+    countryCode: 'US',
+    locationStatus: 'ENABLED',
+    lastSyncedAt: NOW.toISOString(),
+    isArchived: false,
+  });
+
+  const defaultsWrite = calls.find(
+    (call) =>
+      call.options.method === 'POST' &&
+      call.url.endsWith(
+        '/tablesdb/keepflip/tables/ebay_seller_listing_defaults/rows',
+      ),
+  );
+  const defaultsData = JSON.parse(defaultsWrite.options.body).data;
+  assert.deepEqual(defaultsData, {
+    ownerId: OWNER_ID,
+    environment: 'sandbox',
+    marketplaceId: 'EBAY_US',
+    defaultMerchantLocationKey: 'warehouse-main',
+    defaultPaymentPolicyId: 'payment-policy-one',
+    defaultFulfillmentPolicyId: 'fulfillment-policy-one',
+    defaultReturnPolicyId: 'return-policy-one',
+    defaultListingDuration: 'GTC',
+    defaultFormat: 'FIXED_PRICE',
+    defaultCurrency: 'USD',
+    defaultQuantity: 1,
+    defaultCategoryId: null,
+    defaultCondition: null,
+    defaultStoreCategoryId: null,
+    selectionSource: 'ebay_import',
+    updatedAt: NOW.toISOString(),
+  });
+
+  const storedData = JSON.stringify([
+    ...policyWrites,
+    locationData,
+    defaultsData,
+  ]);
+  assert.equal(storedData.includes(accessToken), false);
+  assert.equal(storedData.includes(refreshToken), false);
+  assert.equal(storedData.includes(privateEmail), false);
+  assert.equal(storedData.includes(privateAddress), false);
+  assert.equal(storedData.includes('Never store this text.'), false);
+  assert.equal(storedData.includes('do-not-store'), false);
+
+  const setupRequests = calls.filter((call) =>
+    call.url.startsWith('https://api.sandbox.ebay.com/sell/'),
+  );
+  assert.equal(setupRequests.length, 4);
+  for (const request of setupRequests) {
+    assert.equal(request.options.headers.Authorization, 'Bearer ' + accessToken);
+  }
+});
+test('publishes with saved listing defaults when the request does not override them', async () => {
+  configureEnvironment();
+  const accessToken = 'access-token-that-must-not-leak';
+  const refreshToken = 'refresh-token-that-must-not-leak';
+  const itemId = 'item-defaults-001';
+  const calls = [];
+  const errors = [];
+  const handler = createHandler({
+    fetchImpl: async (url, options = {}) => {
+      const request = { options, url: String(url) };
+      calls.push(request);
+
+      if (request.url.endsWith('/account')) {
+        return jsonResponse(200, { $id: OWNER_ID });
+      }
+      if (
+        request.url.endsWith('/rows/' + itemId) &&
+        options.method === 'GET'
+      ) {
+        return jsonResponse(200, {
+          $id: itemId,
+          ownerId: OWNER_ID,
+          title: 'Vintage wool jacket',
+          description: 'A clean vintage wool jacket with a classic fit.',
+          condition: 'USED_GOOD',
+          coverPhotoId: 'photo-file-one',
+        });
+      }
+      if (
+        request.url.endsWith(
+          '/rows/' + connectionRowId(OWNER_ID, 'sandbox'),
+        ) &&
+        options.method === 'GET'
+      ) {
+        return jsonResponse(200, {
+          ownerId: OWNER_ID,
+          encryptedTokens: tokenCiphertext({
+            accessToken,
+            accessTokenExpiresAt: '2026-08-25T13:00:00.000Z',
+            refreshToken,
+            refreshTokenExpiresAt: '2027-08-25T12:00:00.000Z',
+          }),
+          revokedAt: null,
+        });
+      }
+      if (
+        request.url.endsWith(
+          '/rows/' + sellerListingDefaultsRowId(OWNER_ID, 'sandbox', 'EBAY_US'),
+        ) &&
+        options.method === 'GET'
+      ) {
+        return jsonResponse(200, {
+          ownerId: OWNER_ID,
+          environment: 'sandbox',
+          marketplaceId: 'EBAY_US',
+          defaultMerchantLocationKey: 'warehouse-main',
+          defaultPaymentPolicyId: 'payment-policy-one',
+          defaultFulfillmentPolicyId: 'fulfillment-policy-one',
+          defaultReturnPolicyId: 'return-policy-one',
+          defaultListingDuration: 'GTC',
+          defaultCurrency: 'USD',
+          defaultQuantity: 2,
+        });
+      }
+      if (
+        request.url ===
+          'https://api.sandbox.ebay.com/sell/inventory/v1/inventory_item/KF-item-defaults-001' &&
+        options.method === 'PUT'
+      ) {
+        return jsonResponse(204);
+      }
+      if (
+        request.url ===
+          'https://api.sandbox.ebay.com/sell/inventory/v1/offer?sku=KF-item-defaults-001&marketplace_id=EBAY_US' &&
+        options.method === 'GET'
+      ) {
+        return jsonResponse(200, { offers: [] });
+      }
+      if (
+        request.url === 'https://api.sandbox.ebay.com/sell/inventory/v1/offer' &&
+        options.method === 'POST'
+      ) {
+        return jsonResponse(201, { offerId: 'offer-defaults-001' });
+      }
+      if (
+        request.url ===
+          'https://api.sandbox.ebay.com/sell/inventory/v1/offer/offer-defaults-001/publish' &&
+        options.method === 'POST'
+      ) {
+        return jsonResponse(200, { listingId: 'listing-defaults-001' });
+      }
+      if (
+        request.url.startsWith(
+          'https://appwrite.example/v1/tablesdb/keepflip/tables/ebay_seller_listings/rows/',
+        ) &&
+        options.method === 'PATCH'
+      ) {
+        return jsonResponse(200, { $id: 'listing-cache-row' });
+      }
+
+      throw new Error('Unexpected request: ' + request.url);
+    },
+    now: () => NOW,
+  });
+  const sink = responseSink();
+
+  await handler({
+    req: {
+      bodyJson: {
+        environment: 'sandbox',
+        itemId,
+        price: 50,
+        categoryId: '11450',
+      },
+      headers: authenticatedHeaders(),
+      method: 'POST',
+      path: '/listing',
+    },
+    res: sink.res,
+    error: (message) => errors.push(message),
+  });
+
+  assert.deepEqual(errors, []);
+  assert.equal(sink.response().statusCode, 200);
+  assert.equal(sink.response().body.status, 'published');
+
+  const offerRequest = calls.find(
+    (call) =>
+      call.url === 'https://api.sandbox.ebay.com/sell/inventory/v1/offer' &&
+      call.options.method === 'POST',
+  );
+  const offer = JSON.parse(offerRequest.options.body);
+  assert.deepEqual(offer.listingPolicies, {
+    paymentPolicyId: 'payment-policy-one',
+    fulfillmentPolicyId: 'fulfillment-policy-one',
+    returnPolicyId: 'return-policy-one',
+  });
+  assert.equal(offer.merchantLocationKey, 'warehouse-main');
+  assert.equal(offer.availableQuantity, 2);
+  assert.equal(offer.listingDuration, 'GTC');
+  assert.equal(offer.pricingSummary.price.currency, 'USD');
+
+  const inventoryRequest = calls.find(
+    (call) =>
+      call.url ===
+        'https://api.sandbox.ebay.com/sell/inventory/v1/inventory_item/KF-item-defaults-001' &&
+      call.options.method === 'PUT',
+  );
+  const inventory = JSON.parse(inventoryRequest.options.body);
+  assert.equal(
+    inventory.availability.shipToLocationAvailability.quantity,
+    2,
+  );
+  assert.equal(
+    JSON.stringify(sink.response().body).includes(accessToken),
+    false,
+  );
+  assert.equal(
+    JSON.stringify(sink.response().body).includes(refreshToken),
+    false,
+  );
 });
