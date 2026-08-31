@@ -64,7 +64,7 @@ function firstEnvironmentValue(names, fallback = '') {
 function requiredEnvironmentValue(names) {
   const value = firstEnvironmentValue(names);
   if (!value) {
-    throw new Error('Missing required eBay OAuth Function configuration.');
+    error('Missing required eBay OAuth Function configuration.');
   }
 
   return value;
@@ -76,7 +76,7 @@ function normalizeEnvironment(value, label = 'OAuth environment') {
     return environment;
   }
 
-  throw new HttpError(400, label + ' must be "sandbox" or "production".');
+  error(400, label + ' must be "sandbox" or "production".');
 }
 
 function functionRuntime() {
@@ -93,7 +93,7 @@ function functionDynamicKey(req) {
     cleanText(process.env.APPWRITE_FUNCTION_API_KEY);
 
   if (!key) {
-    throw new Error('Appwrite did not provide this Function a dynamic API key.');
+    error('Appwrite did not provide this Function a dynamic API key.');
   }
 
   return key;
@@ -154,12 +154,12 @@ function tableConfiguration() {
 function decodeEncryptionKey() {
   const text = requiredEnvironmentValue(['EBAY_TOKEN_ENCRYPTION_KEY']);
   if (!/^[A-Za-z0-9+/]+={0,2}$/.test(text)) {
-    throw new Error('EBAY_TOKEN_ENCRYPTION_KEY must be a Base64 32-byte key.');
+    error('EBAY_TOKEN_ENCRYPTION_KEY must be a Base64 32-byte key.');
   }
 
   const key = Buffer.from(text, 'base64');
   if (key.length !== 32) {
-    throw new Error('EBAY_TOKEN_ENCRYPTION_KEY must decode to exactly 32 bytes.');
+    error('EBAY_TOKEN_ENCRYPTION_KEY must decode to exactly 32 bytes.');
   }
 
   return key;
@@ -254,7 +254,7 @@ function rowPath(configuration, tableId, rowId) {
 async function authenticatedUserId({ req, fetchImpl, runtime }) {
   const jwt = requestHeader(req?.headers, 'x-appwrite-user-jwt');
   if (!jwt) {
-    throw new HttpError(
+    error(
       401,
       'You must be signed in to KeepFlip to connect eBay.',
     );
@@ -270,7 +270,7 @@ async function authenticatedUserId({ req, fetchImpl, runtime }) {
       failureMessage: 'KeepFlip could not verify your signed-in session.',
     });
   } catch {
-    throw new HttpError(
+    error(
       401,
       'You must be signed in to KeepFlip to connect eBay.',
     );
@@ -283,7 +283,7 @@ async function authenticatedUserId({ req, fetchImpl, runtime }) {
   );
 
   if (!userId || (executionUserId && executionUserId !== userId)) {
-    throw new HttpError(
+    error(
       401,
       'You must be signed in to KeepFlip to connect eBay.',
     );
@@ -306,7 +306,7 @@ function currentDate(now) {
   const value = now();
   const date = value instanceof Date ? new Date(value.getTime()) : new Date(value);
   if (Number.isNaN(date.getTime())) {
-    throw new Error('The OAuth Function clock is invalid.');
+    error('The OAuth Function clock is invalid.');
   }
 
   return date;
@@ -315,7 +315,7 @@ function currentDate(now) {
 function addSeconds(date, seconds) {
   const numeric = Number(seconds);
   if (!Number.isFinite(numeric) || numeric <= 0) {
-    throw new Error('eBay did not return a valid token expiration.');
+    error('eBay did not return a valid token expiration.');
   }
 
   return new Date(date.getTime() + numeric * 1000).toISOString();
@@ -376,7 +376,7 @@ async function createStateRecord({
     });
   } catch (caught) {
     if (caught instanceof HttpError) throw caught;
-    throw new HttpError(
+    error(
       500,
       'KeepFlip could not start the eBay authorization flow.',
     );
@@ -406,7 +406,7 @@ async function getConnection({
     });
   } catch (caught) {
     if (caught instanceof UpstreamError && caught.status === 404) return null;
-    throw new HttpError(
+    error(
       500,
       'KeepFlip could not read the eBay connection.',
     );
@@ -442,7 +442,7 @@ function decryptSecret(value, key) {
     !ciphertextText ||
     extra.length > 0
   ) {
-    throw new Error('Stored eBay token data is invalid.');
+    error('Stored eBay token data is invalid.');
   }
 
   const decipher = createDecipheriv(
@@ -470,7 +470,7 @@ function readTokenBundle(connection, configuration) {
       decryptSecret(ciphertext, configuration.encryptionKey),
     );
   } catch {
-    throw new HttpError(
+    error(
       500,
       'KeepFlip could not read the stored eBay connection.',
     );
@@ -483,7 +483,7 @@ function readTokenBundle(connection, configuration) {
     typeof tokenBundle.accessTokenExpiresAt !== 'string' ||
     typeof tokenBundle.refreshTokenExpiresAt !== 'string'
   ) {
-    throw new HttpError(
+    error(
       500,
       'KeepFlip could not read the stored eBay connection.',
     );
@@ -546,7 +546,7 @@ async function refreshToken({
   const clock = currentDate(now);
   const refreshExpiry = Date.parse(tokenBundle.refreshTokenExpiresAt);
   if (!Number.isFinite(refreshExpiry) || refreshExpiry <= clock.getTime()) {
-    throw new HttpError(
+    error(
       401,
       'Your eBay authorization has expired. Reconnect your eBay account.',
     );
@@ -574,7 +574,7 @@ async function refreshToken({
       body: form.toString(),
     });
   } catch {
-    throw new HttpError(502, 'KeepFlip could not refresh the eBay authorization.');
+    error(502, 'KeepFlip could not refresh the eBay authorization.');
   }
 
   const payload = await parseResponseBody(response);
@@ -583,7 +583,7 @@ async function refreshToken({
     typeof payload?.access_token !== 'string' ||
     !payload.access_token
   ) {
-    throw new HttpError(502, 'KeepFlip could not refresh the eBay authorization.');
+    error(502, 'KeepFlip could not refresh the eBay authorization.');
   }
 
   const nextRefreshToken =
@@ -644,7 +644,7 @@ async function saveRefreshedConnection({
       failureMessage: 'KeepFlip could not save the refreshed eBay authorization.',
     });
   } catch {
-    throw new HttpError(
+    error(
       500,
       'KeepFlip could not save the refreshed eBay authorization.',
     );
@@ -690,7 +690,7 @@ async function revokeEbayAuthorization({
       body: form.toString(),
     });
   } catch {
-    throw new HttpError(502, 'KeepFlip could not revoke eBay access.');
+    error(502, 'KeepFlip could not revoke eBay access.');
   }
 
   const payload = await parseResponseBody(response);
@@ -701,7 +701,7 @@ async function revokeEbayAuthorization({
     return;
   }
 
-  throw new HttpError(502, 'KeepFlip could not revoke eBay access.');
+  error(502, 'KeepFlip could not revoke eBay access.');
 }
 
 async function markConnectionRevoked({
@@ -735,7 +735,7 @@ async function markConnectionRevoked({
       failureMessage: 'KeepFlip could not remove the eBay connection.',
     });
   } catch {
-    throw new HttpError(500, 'KeepFlip could not remove the eBay connection.');
+    error(500, 'KeepFlip could not remove the eBay connection.');
   }
 }
 
@@ -764,7 +764,7 @@ function bodyObject(value) {
 function requiredListingValue(body, name, maxLength = 255) {
   const value = cleanText(body?.[name], maxLength);
   if (!value) {
-    throw new HttpError(400, 'eBay listing field "' + name + '" is required.');
+    error(400, 'eBay listing field "' + name + '" is required.');
   }
   return value;
 }
@@ -780,7 +780,7 @@ function listingNumber(value, name, { integer = false, minimum = 0 } = {}) {
     number < minimum ||
     (integer && !Number.isInteger(number))
   ) {
-    throw new HttpError(400, 'eBay listing field "' + name + '" is invalid.');
+    error(400, 'eBay listing field "' + name + '" is invalid.');
   }
   return number;
 }
@@ -828,13 +828,13 @@ async function getOwnedInventoryItem({
     });
   } catch (caught) {
     if (caught instanceof UpstreamError && caught.status === 404) {
-      throw new HttpError(404, 'That inventory item could not be found.');
+      error(404, 'That inventory item could not be found.');
     }
-    throw new HttpError(500, 'KeepFlip could not read that inventory item.');
+    error(500, 'KeepFlip could not read that inventory item.');
   }
 
   if (item?.ownerId !== userId) {
-    throw new HttpError(403, 'You do not have access to this inventory item.');
+    error(403, 'You do not have access to this inventory item.');
   }
   return item;
 }
@@ -900,7 +900,7 @@ async function getInventoryPhotoFileIds({
 
   const uniqueIds = [...new Set(ids)].slice(0, 12);
   if (!uniqueIds.length) {
-    throw new HttpError(400, 'Add at least one item photo before publishing on eBay.');
+    error(400, 'Add at least one item photo before publishing on eBay.');
   }
   return uniqueIds;
 }
@@ -960,7 +960,7 @@ async function ebayApiRequest({
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     });
   } catch {
-    throw new HttpError(502, 'KeepFlip could not reach eBay to publish this listing.');
+    error(502, 'KeepFlip could not reach eBay to publish this listing.');
   }
 
   const rawBody = await response.text();
@@ -1094,7 +1094,7 @@ async function handleEbayListing({
     userId,
   });
   if (!connection || connection.revokedAt) {
-    throw new HttpError(404, 'Connect an eBay account before publishing a listing.');
+    error(404, 'Connect an eBay account before publishing a listing.');
   }
 
   const accessToken = await ensureEbayAccessToken({
@@ -1119,8 +1119,8 @@ async function handleEbayListing({
   const description =
     listingString(body.description, 500_000) ||
     listingString(item.description, 500_000);
-  if (!title) throw new HttpError(400, 'eBay listings need a title.');
-  if (!description) throw new HttpError(400, 'eBay listings need a description.');
+  if (!title) error(400, 'eBay listings need a title.');
+  if (!description) error(400, 'eBay listings need a description.');
 
   const price = listingNumber(
     body.price ??
@@ -1134,7 +1134,7 @@ async function handleEbayListing({
   });
   const categoryId = requiredListingValue(body, 'categoryId', 20);
   if (!/^\d+$/.test(categoryId)) {
-    throw new HttpError(400, 'eBay categoryId must be a numeric category ID.');
+    error(400, 'eBay categoryId must be a numeric category ID.');
   }
 
   const marketplaceId = listingString(body.marketplaceId, 40) || 'EBAY_US';
@@ -1157,7 +1157,7 @@ async function handleEbayListing({
     : listingString(body.conditionDescription || item.conditionNotes || item.description, 1_000);
   const sku = listingString(body.sku, 50) || ('KF-' + itemId).slice(0, 50);
   if (!/^[A-Za-z0-9._-]+$/.test(sku)) {
-    throw new HttpError(
+    error(
       400,
       'eBay SKU may contain only letters, numbers, periods, underscores, and hyphens.',
     );
@@ -1242,7 +1242,7 @@ async function handleEbayListing({
     });
     offerId = listingString(createdOffer.payload?.offerId, 100);
     if (!offerId) {
-      throw new HttpError(502, 'eBay created the offer but did not return an offer ID.');
+      error(502, 'eBay created the offer but did not return an offer ID.');
     }
   }
 
@@ -1349,7 +1349,7 @@ async function handleRefresh({
   });
 
   if (!connection || connection.ownerId !== userId || connection.revokedAt) {
-    throw new HttpError(404, 'No connected eBay account was found.');
+    error(404, 'No connected eBay account was found.');
   }
 
   const tokenBundle = await refreshToken({
@@ -1433,7 +1433,7 @@ export function createHandler({
   randomBytesImpl = randomBytes,
 } = {}) {
   if (typeof fetchImpl !== 'function') {
-    throw new Error('A fetch implementation is required.');
+    error('A fetch implementation is required.');
   }
 
   return async function main({ req, res, error } = {}) {
