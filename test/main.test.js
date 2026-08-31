@@ -272,7 +272,7 @@ test('refreshes the stored token without exposing it to the app', async () => {
       }
       if (
         request.url ===
-        'https://api.sandbox.ebay.com/identity/v1/oauth2/token'
+        'https://apiz.sandbox.ebay.com/identity/v1/oauth2/token'
       ) {
         return jsonResponse(200, {
           access_token: refreshedAccessToken,
@@ -410,7 +410,7 @@ test('syncs an allowlisted seller profile and returns only safe cached listing d
       }
       if (
         request.url ===
-        'https://api.sandbox.ebay.com/commerce/identity/v1/user/'
+        'https://apiz.sandbox.ebay.com/commerce/identity/v1/user/'
       ) {
         return jsonResponse(200, {
           userId: ebayUserId,
@@ -579,7 +579,7 @@ test('syncs safe eBay policies, locations, and unambiguous listing defaults', as
       }
       if (
         request.url ===
-        'https://api.sandbox.ebay.com/commerce/identity/v1/user/'
+        'https://apiz.sandbox.ebay.com/commerce/identity/v1/user/'
       ) {
         return jsonResponse(200, {
           userId: 'raw-ebay-user-id-must-not-persist',

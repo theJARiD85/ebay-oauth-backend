@@ -1239,6 +1239,12 @@ function ebayApiBase(configuration) {
     : 'https://api.sandbox.ebay.com';
 }
 
+function ebayIdentityApiBase(configuration) {
+  return configuration.environment === 'production'
+    ? 'https://apiz.ebay.com'
+    : 'https://apiz.sandbox.ebay.com';
+}
+
 function eBayApiErrorDetail(payload, rawBody) {
   const details = [];
   if (Array.isArray(payload?.errors)) {
@@ -1520,29 +1526,67 @@ function sellerListingForApp(listing) {
     : null;
 }
 
-async function ebayIdentityUser({ fetchImpl, configuration, accessToken }) {
+async function ebayIdentityUser({
+  fetchImpl,
+  configuration,
+  accessToken,
+}) {
+  const url =
+    ebayIdentityApiBase(configuration) +
+    '/commerce/identity/v1/user/';
+
   let response;
+
   try {
-    response = await fetchImpl(
-      ebayApiBase(configuration) + '/commerce/identity/v1/user/',
-      {
-        method: 'GET',
-        headers: {
-          Accept: 'application/json',
-          Authorization: 'Bearer ' + accessToken,
-        },
+    response = await fetchImpl(url, {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json',
+        Authorization: 'Bearer ' + accessToken,
       },
-    );
+    });
   } catch {
-    error(502, 'KeepFlip could not reach eBay to read seller details.');
+    error(
+      502,
+      'KeepFlip could not reach eBay to read seller details.',
+      'EBAY_IDENTITY_NETWORK',
+    );
   }
 
-  const payload = await parseResponseBody(response);
-  if (!response.ok) {
-    if (response.status === 401 || response.status === 403) {
-      error(401, 'Your eBay authorization needs to be reconnected.');
+  const rawBody = await response.text();
+
+  let payload = {};
+
+  if (rawBody.trim()) {
+    try {
+      payload = JSON.parse(rawBody);
+    } catch {
+      payload = {};
     }
-    error(502, 'KeepFlip could not read your eBay seller information.');
+  }
+
+  if (!response.ok) {
+    if (response.status === 401) {
+      error(
+        401,
+        'Your eBay authorization needs to be reconnected.',
+        'EBAY_IDENTITY_UNAUTHORIZED',
+      );
+    }
+
+    if (response.status === 403) {
+      error(
+        401,
+        'Your eBay authorization does not have permission to read seller information. Reconnect your eBay account.',
+        'EBAY_IDENTITY_FORBIDDEN',
+      );
+    }
+
+    error(
+      502,
+      'KeepFlip could not read your eBay seller information.',
+      'EBAY_IDENTITY_HTTP_' + String(response.status || 'UNKNOWN'),
+    );
   }
 
   return payload;
