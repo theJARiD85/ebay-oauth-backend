@@ -406,7 +406,7 @@ async function getConnection({
     });
   } catch (caught) {
     if (caught instanceof UpstreamError && caught.status === 404) return null;
-    error(
+    (
       500,
       'KeepFlip could not read the eBay connection.',
     );
