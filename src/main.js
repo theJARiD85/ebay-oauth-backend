@@ -30,6 +30,15 @@ class UpstreamError extends Error {
   }
 }
 
+function error(statusOrMessage, message) {
+  const status = typeof statusOrMessage === 'number' ? statusOrMessage : 500;
+  const detail = typeof statusOrMessage === 'number' ? message : statusOrMessage;
+  throw new HttpError(
+    status,
+    cleanText(detail) || 'KeepFlip could not complete the eBay OAuth request.',
+  );
+}
+
 function cleanText(value, maxLength = 8_000) {
   if (typeof value !== 'string') return '';
   const cleaned = value.trim();
@@ -406,7 +415,7 @@ async function getConnection({
     });
   } catch (caught) {
     if (caught instanceof UpstreamError && caught.status === 404) return null;
-    (
+    error(
       500,
       'KeepFlip could not read the eBay connection.',
     );
