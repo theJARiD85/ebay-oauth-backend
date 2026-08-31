@@ -1269,6 +1269,7 @@ async function ebayApiRequest({
   body,
 }) {
   let response;
+  log(ebayApiBase(configuration) + path);
   try {
     response = await fetchImpl(ebayApiBase(configuration) + path, {
       method,
