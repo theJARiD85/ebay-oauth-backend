@@ -3097,7 +3097,9 @@ function safeError(error, caught, path = '') {
         ' status=' +
         status +
         ' reason=' +
-        code,
+        code +
+        ' error=' +
+        JSON.stringify(caught),
     );
   }
 }
@@ -3201,7 +3203,7 @@ export function createHandler({
           error:
             status >= 500
               ? 'KeepFlip could not complete the eBay OAuth request.'
-              : caught.message,
+              : caught,
         },
         status,
       );
