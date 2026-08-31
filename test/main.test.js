@@ -272,7 +272,7 @@ test('refreshes the stored token without exposing it to the app', async () => {
       }
       if (
         request.url ===
-        'https://apiz.sandbox.ebay.com/identity/v1/oauth2/token'
+        'https://api.sandbox.ebay.com/identity/v1/oauth2/token'
       ) {
         return jsonResponse(200, {
           access_token: refreshedAccessToken,
@@ -284,9 +284,9 @@ test('refreshes the stored token without exposing it to the app', async () => {
         request.url.endsWith(
           '/rows/' + connectionRowId(OWNER_ID, 'sandbox'),
         ) &&
-        options.method === 'DELETE'
+        options.method === 'PATCH'
       ) {
-        return jsonResponse(204);
+        return jsonResponse(200, { $id: 'connection-row' });
       }
 
       throw new Error('Unexpected request: ' + request.url);
@@ -516,7 +516,7 @@ test('syncs an allowlisted seller profile and returns only safe cached listing d
   const identityRequest = calls.find(
     (call) =>
       call.url ===
-      'https://api.sandbox.ebay.com/commerce/identity/v1/user/',
+      'https://apiz.sandbox.ebay.com/commerce/identity/v1/user/',
   );
   assert.equal(
     identityRequest.options.headers.Authorization,
@@ -529,6 +529,10 @@ test('syncs an allowlisted seller profile and returns only safe cached listing d
         '/tablesdb/keepflip/tables/ebay_seller_profiles/rows',
       ) && call.options.method === 'POST',
   );
+  assert.ok(
+    profileWrite,
+    `Expected a seller-profile create request. Calls: ${JSON.stringify(calls)}`,
+  );
   const profileData = JSON.parse(profileWrite.options.body).data;
   assert.equal(profileData.ownerId, OWNER_ID);
   assert.equal(profileData.environment, 'sandbox');
@@ -537,6 +541,112 @@ test('syncs an allowlisted seller profile and returns only safe cached listing d
   assert.equal(profileData.ebayProfileSnapshotJson.includes(privateEmail), false);
   assert.equal(profileData.ebayProfileSnapshotJson.includes(privatePhone), false);
 });
+
+test('reports a seller-profile Appwrite failure as an upstream 502', async () => {
+  configureEnvironment();
+  const accessToken = 'access-token-that-must-not-leak';
+  const refreshToken = 'refresh-token-that-must-not-leak';
+  const calls = [];
+  const logs = [];
+  const handler = createHandler({
+    fetchImpl: async (url, options = {}) => {
+      const request = { options, url: String(url) };
+      calls.push(request);
+
+      if (request.url.endsWith('/account')) {
+        return jsonResponse(200, { $id: OWNER_ID });
+      }
+      if (
+        request.url.endsWith(
+          '/rows/' + connectionRowId(OWNER_ID, 'sandbox'),
+        ) &&
+        options.method === 'GET'
+      ) {
+        return jsonResponse(200, {
+          ownerId: OWNER_ID,
+          encryptedTokens: tokenCiphertext({
+            accessToken,
+            accessTokenExpiresAt: '2026-08-25T13:00:00.000Z',
+            refreshToken,
+            refreshTokenExpiresAt: '2027-08-25T12:00:00.000Z',
+          }),
+          revokedAt: null,
+        });
+      }
+      if (
+        request.url.endsWith(
+          '/rows/' + sellerProfileRowId(OWNER_ID, 'sandbox'),
+        ) &&
+        (options.method === 'GET' || options.method === 'PATCH')
+      ) {
+        return jsonResponse(404);
+      }
+      if (
+        request.url.endsWith(
+          '/tablesdb/keepflip/tables/ebay_seller_profiles/rows',
+        ) &&
+        options.method === 'POST'
+      ) {
+        return jsonResponse(400, { message: 'Table is not ready.' });
+      }
+      if (
+        request.url ===
+        'https://apiz.sandbox.ebay.com/commerce/identity/v1/user/'
+      ) {
+        return jsonResponse(200, {
+          username: 'keepflip.ebay',
+          accountType: 'BUSINESS',
+          accountStatus: 'CONFIRMED',
+          registrationMarketplaceId: 'EBAY_US',
+        });
+      }
+      if (request.url.startsWith('https://api.sandbox.ebay.com/sell/')) {
+        return jsonResponse(503);
+      }
+      if (
+        request.url.startsWith(
+          'https://appwrite.example/v1/tablesdb/keepflip/tables/ebay_seller_listings/rows?',
+        )
+      ) {
+        return jsonResponse(404);
+      }
+
+      throw new Error('Unexpected request: ' + request.url);
+    },
+    now: () => NOW,
+  });
+  const sink = responseSink();
+
+  await handler({
+    error: (message) => logs.push(message),
+    req: {
+      bodyJson: { environment: 'sandbox' },
+      headers: authenticatedHeaders(),
+      method: 'POST',
+      path: '/seller-account',
+    },
+    res: sink.res,
+  });
+
+  assert.equal(sink.response().statusCode, 502);
+  assert.deepEqual(sink.response().body, {
+    error: 'KeepFlip could not complete the eBay OAuth request.',
+  });
+  assert.deepEqual(logs, [
+    'KeepFlip eBay OAuth backend request failed. route=/seller-account status=502 reason=SELLER_ACCOUNT_APPWRITE_400',
+  ]);
+  assert.equal(
+    calls.some(
+      (call) =>
+        call.options.method === 'POST' &&
+        call.url.endsWith(
+          '/tablesdb/keepflip/tables/ebay_seller_profiles/rows',
+        ),
+    ),
+    true,
+  );
+});
+
 test('syncs safe eBay policies, locations, and unambiguous listing defaults', async () => {
   configureEnvironment();
   const accessToken = 'access-token-that-must-not-leak';

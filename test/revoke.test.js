@@ -108,9 +108,9 @@ test('revokes the owner eBay refresh token and clears local credentials without 
         request.url.endsWith(
           '/rows/' + connectionRowId(OWNER_ID, 'sandbox'),
         ) &&
-        options.method === 'PATCH'
+        options.method === 'DELETE'
       ) {
-        return jsonResponse(200, { $id: 'connection-row' });
+        return jsonResponse(204);
       }
 
       throw new Error('Unexpected request: ' + request.url);
@@ -153,3 +153,4 @@ test('revokes the owner eBay refresh token and clears local credentials without 
     localDelete.options.body,
     undefined,
   );
+});

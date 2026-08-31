@@ -1311,7 +1311,6 @@ async function ebayApiRequest({
   body,
 }) {
   let response;
-  context.log(ebayApiBase(configuration) + path);
   try {
     response = await fetchImpl(ebayApiBase(configuration) + path, {
       method,
@@ -2607,7 +2606,18 @@ async function handleSellerAccount({
     }
     if (!(cachedProfile && caught instanceof HttpError && caught.status === 502)) {
       if (caught instanceof HttpError) throw caught;
-      error(500, 'KeepFlip could not prepare the seller account.');
+      if (caught instanceof UpstreamError) {
+        error(
+          502,
+          'KeepFlip could not prepare the seller account.',
+          'SELLER_ACCOUNT_APPWRITE_' + String(caught.status || 'NETWORK'),
+        );
+      }
+      error(
+        500,
+        'KeepFlip could not prepare the seller account.',
+        'SELLER_ACCOUNT_UNEXPECTED',
+      );
     }
   }
 
@@ -2982,34 +2992,45 @@ async function handleConnect({
   });
 }
 
-function safeError(error, caught, path = '') {
-  if (typeof error === 'function') {
-    const route = cleanText(path, 80) || 'unknown';
-    const code =
-      caught instanceof HttpError
-        ? cleanText(caught.diagnosticCode, 80) || 'HTTP_' + caught.status
-        : caught instanceof UpstreamError
-          ? 'UPSTREAM_' + (caught.status || 'NETWORK')
-          : ['TypeError', 'ReferenceError', 'SyntaxError', 'RangeError'].includes(
-                cleanText(caught?.name, 32),
-              )
-            ? 'UNEXPECTED_' + cleanText(caught?.name, 32).toUpperCase()
-            : 'UNEXPECTED';
-    const status =
-      caught instanceof HttpError || caught instanceof UpstreamError
-        ? String(caught.status || 500)
-        : '500';
-    error(
-      'KeepFlip eBay OAuth backend request failed. route=' +
-        route +
-        ' status=' +
-        status +
-        ' reason=' +
-        code +
-        ' error=' +
-        JSON.stringify(caught),
-    );
-  }
+function safeError(reportError, caught, path = '') {
+  if (typeof reportError !== 'function') return;
+
+  const route = cleanText(path, 80) || 'unknown';
+  const errorName = cleanText(caught?.name, 32);
+  const code =
+    caught instanceof HttpError
+      ? cleanText(caught.diagnosticCode, 80) || 'HTTP_' + caught.status
+      : caught instanceof UpstreamError
+        ? 'UPSTREAM_' + (caught.status || 'NETWORK')
+        : ['TypeError', 'ReferenceError', 'SyntaxError', 'RangeError'].includes(
+              errorName,
+            )
+          ? 'UNEXPECTED_' + errorName.toUpperCase()
+          : 'UNEXPECTED';
+  const status =
+    caught instanceof HttpError || caught instanceof UpstreamError
+      ? String(caught.status || 500)
+      : '500';
+  const unexpectedDetail =
+    caught instanceof HttpError || caught instanceof UpstreamError
+      ? ''
+      : cleanText(caught?.message, 240);
+
+  reportError(
+    'KeepFlip eBay OAuth backend request failed. route=' +
+      route +
+      ' status=' +
+      status +
+      ' reason=' +
+      code +
+      (unexpectedDetail ? ' detail=' + unexpectedDetail : ''),
+  );
+}
+
+function responseStatus(caught) {
+  if (caught instanceof HttpError) return caught.status;
+  if (caught instanceof UpstreamError) return 502;
+  return 500;
 }
 
 async function handleStatus({ req, res, fetchImpl, runtime, now, error: reportError }) {
@@ -3050,7 +3071,7 @@ async function handleStatus({ req, res, fetchImpl, runtime, now, error: reportEr
         needsReconnect: true,
       });
     }
-      log(caught);
+    throw caught;
   }
 }
 
@@ -3294,7 +3315,7 @@ export function createHandler({
 
       return res.json({ error: 'Endpoint not found.' }, 404);
     } catch (caught) {
-      const status = caught instanceof HttpError ? caught.status : 500;
+      const status = responseStatus(caught);
       if (status >= 500) safeError(error, caught, path);
 
       return res.json(
@@ -3302,7 +3323,9 @@ export function createHandler({
           error:
             status >= 500
               ? 'KeepFlip could not complete the eBay OAuth request.'
-              : caught,
+              : caught instanceof HttpError
+                ? caught.message
+                : 'KeepFlip could not complete the eBay OAuth request.',
         },
         status,
       );
