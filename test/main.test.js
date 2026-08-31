@@ -284,9 +284,9 @@ test('refreshes the stored token without exposing it to the app', async () => {
         request.url.endsWith(
           '/rows/' + connectionRowId(OWNER_ID, 'sandbox'),
         ) &&
-        options.method === 'PATCH'
+        options.method === 'DELETE'
       ) {
-        return jsonResponse(200, { $id: 'connection-row' });
+        return jsonResponse(204);
       }
 
       throw new Error('Unexpected request: ' + request.url);

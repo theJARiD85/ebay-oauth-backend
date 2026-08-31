@@ -136,18 +136,20 @@ test('revokes the owner eBay refresh token and clears local credentials without 
   assert.equal(JSON.stringify(sink.response()).includes(accessToken), false);
   assert.equal(JSON.stringify(sink.response()).includes(refreshToken), false);
 
-  const localWrite = calls.find(
+  const localDelete = calls.find(
     (call) =>
       call.url.endsWith(
         '/rows/' + connectionRowId(OWNER_ID, 'sandbox'),
-      ) && call.options.method === 'PATCH',
+      ) &&
+      call.options.method === 'DELETE',
   );
-  assert.deepEqual(JSON.parse(localWrite.options.body).data, {
-    encryptedTokens: '',
-    ebayUsername: '',
-    revokedAt: NOW.toISOString(),
-    updatedAt: NOW.toISOString(),
-  });
-  assert.equal(localWrite.options.body.includes(accessToken), false);
-  assert.equal(localWrite.options.body.includes(refreshToken), false);
-});
+  
+  assert.ok(
+    localDelete,
+    'Expected the eBay connection row to be deleted.',
+  );
+  
+  assert.equal(
+    localDelete.options.body,
+    undefined,
+  );

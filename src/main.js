@@ -949,12 +949,58 @@ function ebayClientAuthorization(configuration) {
   );
 }
 
-function connectionTokenField(connection) {
-  return (
-    typeof connection?.tokenCiphertext === 'string' && connection.tokenCiphertext
-      ? 'tokenCiphertext'
-      : 'encryptedTokens'
+async function deleteEbayConnection({
+  fetchImpl,
+  req,
+  runtime,
+  configuration,
+  connection,
+}) {
+  const rowId = connectionRowId(
+    connection.ownerId,
+    configuration.environment,
   );
+
+  try {
+    await appwriteJson({
+      fetchImpl,
+      runtime,
+      apiKey: functionDynamicKey(req),
+
+      method: 'DELETE',
+
+      path: rowPath(
+        configuration,
+        configuration.connectionsTableId,
+        rowId,
+      ),
+
+      failureMessage:
+        'KeepFlip could not delete the eBay connection.',
+    });
+  } catch (caught) {
+    /*
+     * Idempotency:
+     *
+     * If the row is already gone, we're already in the desired
+     * disconnected state.
+     */
+    if (
+      caught instanceof UpstreamError &&
+      caught.status === 404
+    ) {
+      return;
+    }
+
+    error(
+      500,
+      'KeepFlip revoked eBay access but could not remove the local connection.',
+      caught instanceof UpstreamError
+        ? 'CONNECTION_DELETE_' +
+            String(caught.status || 'NETWORK')
+        : 'CONNECTION_DELETE_FAILED',
+    );
+  }
 }
 
 async function revokeEbayAuthorization({
@@ -963,70 +1009,66 @@ async function revokeEbayAuthorization({
   tokenBundle,
 }) {
   const form = new URLSearchParams();
+
   form.set('token', tokenBundle.refreshToken);
   form.set('token_type_hint', 'refresh_token');
 
   let response;
+
   try {
-    response = await fetchImpl(ebayRevokeEndpoint(configuration.environment), {
-      method: 'POST',
-      headers: {
-        Accept: 'application/json',
-        Authorization: ebayClientAuthorization(configuration),
-        'Content-Type': 'application/x-www-form-urlencoded',
+    response = await fetchImpl(
+      ebayRevokeEndpoint(configuration.environment),
+      {
+        method: 'POST',
+        headers: {
+          Accept: 'application/json',
+          Authorization: ebayClientAuthorization(configuration),
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: form.toString(),
       },
-      body: form.toString(),
-    });
+    );
   } catch {
-    error(502, 'KeepFlip could not revoke eBay access.');
+    error(
+      502,
+      'KeepFlip could not reach eBay to revoke access.',
+      'EBAY_REVOKE_NETWORK',
+    );
   }
 
   const payload = await parseResponseBody(response);
+
+  /*
+   * Successful revocation.
+   */
+  if (response.ok) {
+    return;
+  }
+
+  /*
+   * If eBay says the token is already invalid, that is effectively
+   * the state we wanted anyway.
+   *
+   * This is especially important after a previous revoke succeeded
+   * remotely but KeepFlip failed to delete the local connection row.
+   */
   if (
-    response.ok ||
-    (response.status === 400 && payload?.error === 'invalid_token')
+    response.status === 400 &&
+    (
+      payload?.error === 'invalid_token' ||
+      payload?.error === 'invalid_grant'
+    )
   ) {
     return;
   }
 
-  error(502, 'KeepFlip could not revoke eBay access.');
+  error(
+    502,
+    'eBay rejected the access revocation request.',
+    'EBAY_REVOKE_HTTP_' +
+      String(response.status || 'UNKNOWN'),
+  );
 }
-
-async function markConnectionRevoked({
-  fetchImpl,
-  req,
-  runtime,
-  configuration,
-  connection,
-  now,
-}) {
-  const revokedAt = currentDate(now).toISOString();
-  const data = {
-    [connectionTokenField(connection)]: '',
-    ebayUsername: '',
-    revokedAt,
-    updatedAt: revokedAt,
-  };
-
-  try {
-    await appwriteJson({
-      fetchImpl,
-      runtime,
-      apiKey: functionDynamicKey(req),
-      method: 'PATCH',
-      path: rowPath(
-        configuration,
-        configuration.connectionsTableId,
-        connectionRowId(connection.ownerId, configuration.environment),
-      ),
-      body: { data },
-      failureMessage: 'KeepFlip could not remove the eBay connection.',
-    });
-  } catch (e) {
-    error(500, 'KeepFlip could not remove the eBay connection.' + e);
-  }
-}
-
 
 const EBAY_INVENTORY_CONDITIONS = new Set([
   'NEW',
@@ -3061,10 +3103,25 @@ async function handleRefresh({
   });
 }
 
-async function handleRevoke({ req, res, fetchImpl, runtime, now }) {
-  const environment = normalizeEnvironment(requestBody(req).environment);
+async function handleRevoke({
+  req,
+  res,
+  fetchImpl,
+  runtime,
+  now,
+}) {
+  const environment = normalizeEnvironment(
+    requestBody(req).environment,
+  );
+
   const configuration = configurationFor(environment);
-  const userId = await authenticatedUserId({ req, fetchImpl, runtime });
+
+  const userId = await authenticatedUserId({
+    req,
+    fetchImpl,
+    runtime,
+  });
+
   const connection = await getConnection({
     fetchImpl,
     req,
@@ -3073,28 +3130,70 @@ async function handleRevoke({ req, res, fetchImpl, runtime, now }) {
     userId,
   });
 
+  /*
+   * There is nothing left to revoke locally.
+   *
+   * Treat this as idempotent success.
+   */
+  if (!connection || connection.ownerId !== userId) {
+    return res.json({
+      revoked: true,
+      connected: false,
+      environment,
+    });
+  }
+
+  /*
+   * A legacy row may have already been marked revoked.
+   * Remove it now instead of leaving dead credentials around.
+   */
   if (
-    !connection ||
-    connection.ownerId !== userId ||
     connection.revokedAt ||
     connection.status === 'revoked'
   ) {
-    return res.json({ revoked: true, connected: false, environment });
+    await deleteEbayConnection({
+      fetchImpl,
+      req,
+      runtime,
+      configuration,
+      connection,
+    });
+
+    return res.json({
+      revoked: true,
+      connected: false,
+      environment,
+    });
   }
 
-  const tokenBundle = readTokenBundle(connection, configuration);
+  const tokenBundle = readTokenBundle(
+    connection,
+    configuration,
+  );
+
+  /*
+   * Revoke remotely FIRST.
+   *
+   * Do not delete the local credentials until eBay has either
+   * successfully revoked them or confirmed they're already invalid.
+   */
   await revokeEbayAuthorization({
     fetchImpl,
     configuration,
     tokenBundle,
   });
-  await markConnectionRevoked({
+
+  /*
+   * Remote revocation succeeded.
+   *
+   * Now completely remove KeepFlip's local connection record.
+   */
+  await deleteEbayConnection({
     fetchImpl,
     req,
     runtime,
     configuration,
     connection,
-    now,
   });
 
   return res.json({
