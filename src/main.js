@@ -750,51 +750,118 @@ async function refreshToken({
 }) {
   const clock = currentDate(now);
   const refreshExpiry = Date.parse(tokenBundle.refreshTokenExpiresAt);
-  if (!Number.isFinite(refreshExpiry) || refreshExpiry <= clock.getTime()) {
+
+  if (
+    !Number.isFinite(refreshExpiry) ||
+    refreshExpiry <= clock.getTime()
+  ) {
     error(
       401,
       'Your eBay authorization has expired. Reconnect your eBay account.',
+      'TOKEN_REFRESH_RECONNECT_REQUIRED',
     );
   }
 
   const form = new URLSearchParams();
+
   form.set('grant_type', 'refresh_token');
   form.set('refresh_token', tokenBundle.refreshToken);
-  form.set('scope', configuration.scopeText);
 
+  /*
+   * IMPORTANT:
+   *
+   * Do NOT send configuration.scopeText here.
+   *
+   * eBay only allows a refresh request to contain scopes that were
+   * originally granted when this refresh token was created.
+   *
+   * configuration.scopeText represents KeepFlip's CURRENT requested
+   * scopes, which may contain permissions that did not exist when an
+   * older user connected their eBay account.
+   *
+   * When the scope parameter is omitted, eBay automatically uses the
+   * scopes associated with the existing refresh token.
+   */
   let response;
+
   try {
-    response = await fetchImpl(ebayTokenEndpoint(configuration.environment), {
-      method: 'POST',
-      headers: {
-        Accept: 'application/json',
-        Authorization:
-          'Basic ' +
-          Buffer.from(
-            configuration.clientId + ':' + configuration.clientSecret,
-            'utf8',
-          ).toString('base64'),
-        'Content-Type': 'application/x-www-form-urlencoded',
+    response = await fetchImpl(
+      ebayTokenEndpoint(configuration.environment),
+      {
+        method: 'POST',
+        headers: {
+          Accept: 'application/json',
+
+          Authorization:
+            'Basic ' +
+            Buffer.from(
+              configuration.clientId +
+                ':' +
+                configuration.clientSecret,
+              'utf8',
+            ).toString('base64'),
+
+          'Content-Type':
+            'application/x-www-form-urlencoded',
+        },
+
+        body: form.toString(),
       },
-      body: form.toString(),
-    });
+    );
   } catch {
-    error(502, 'KeepFlip could not refresh the eBay authorization.');
+    error(
+      502,
+      'KeepFlip could not reach eBay to refresh the authorization.',
+      'TOKEN_REFRESH_NETWORK',
+    );
   }
 
   const payload = await parseResponseBody(response);
+
+  if (!response.ok) {
+    const ebayError = cleanText(payload?.error, 80);
+
+    /*
+     * These errors mean the existing user authorization can no longer
+     * be used. The correct recovery is a new authorization-code /
+     * consent flow.
+     */
+    if (
+      ebayError === 'invalid_grant' ||
+      ebayError === 'invalid_token' ||
+      ebayError === 'invalid_scope'
+    ) {
+      error(
+        401,
+        'Your eBay authorization needs to be reconnected.',
+        'TOKEN_REFRESH_RECONNECT_REQUIRED',
+      );
+    }
+
+    error(
+      502,
+      'KeepFlip could not refresh the eBay authorization.',
+      'TOKEN_REFRESH_HTTP_' + String(response.status || 'UNKNOWN'),
+    );
+  }
+
   if (
-    !response.ok ||
     typeof payload?.access_token !== 'string' ||
     !payload.access_token
   ) {
-    error(502, 'KeepFlip could not refresh the eBay authorization.');
+    error(
+      502,
+      'eBay returned an invalid authorization refresh response.',
+      'TOKEN_REFRESH_RESPONSE_INVALID',
+    );
   }
 
   const nextRefreshToken =
-    typeof payload.refresh_token === 'string' && payload.refresh_token
+    typeof payload.refresh_token === 'string' &&
+    payload.refresh_token
       ? payload.refresh_token
       : tokenBundle.refreshToken;
+
   const nextRefreshExpiresAt =
     payload.refresh_token_expires_in
       ? addSeconds(clock, payload.refresh_token_expires_in)
@@ -802,11 +869,27 @@ async function refreshToken({
 
   return {
     ...tokenBundle,
+
     accessToken: payload.access_token,
-    accessTokenExpiresAt: addSeconds(clock, payload.expires_in),
+
+    accessTokenExpiresAt: addSeconds(
+      clock,
+      payload.expires_in,
+    ),
+
     refreshToken: nextRefreshToken,
+
     refreshTokenExpiresAt: nextRefreshExpiresAt,
-    scopeText: configuration.scopeText,
+
+    /*
+     * Do NOT set:
+     *
+     * scopeText: configuration.scopeText
+     *
+     * Doing so would falsely claim an older authorization possesses
+     * permissions that were added to KeepFlip later.
+     */
+
     updatedAt: clock.toISOString(),
   };
 }
