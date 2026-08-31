@@ -1022,8 +1022,8 @@ async function markConnectionRevoked({
       body: { data },
       failureMessage: 'KeepFlip could not remove the eBay connection.',
     });
-  } catch {
-    error(500, 'KeepFlip could not remove the eBay connection.');
+  } catch (e) {
+    error(500, 'KeepFlip could not remove the eBay connection.' + e);
   }
 }
 
@@ -2940,6 +2940,36 @@ async function handleConnect({
   });
 }
 
+function safeError(error, caught, path = '') {
+  if (typeof error === 'function') {
+    const route = cleanText(path, 80) || 'unknown';
+    const code =
+      caught instanceof HttpError
+        ? cleanText(caught.diagnosticCode, 80) || 'HTTP_' + caught.status
+        : caught instanceof UpstreamError
+          ? 'UPSTREAM_' + (caught.status || 'NETWORK')
+          : ['TypeError', 'ReferenceError', 'SyntaxError', 'RangeError'].includes(
+                cleanText(caught?.name, 32),
+              )
+            ? 'UNEXPECTED_' + cleanText(caught?.name, 32).toUpperCase()
+            : 'UNEXPECTED';
+    const status =
+      caught instanceof HttpError || caught instanceof UpstreamError
+        ? String(caught.status || 500)
+        : '500';
+    error(
+      'KeepFlip eBay OAuth backend request failed. route=' +
+        route +
+        ' status=' +
+        status +
+        ' reason=' +
+        code +
+        ' error=' +
+        JSON.stringify(caught),
+    );
+  }
+}
+
 async function handleStatus({ req, res, fetchImpl, runtime, now, error: reportError }) {
   const environment = normalizeEnvironment(requestBody(req).environment);
   const configuration = configurationFor(environment);
@@ -2978,7 +3008,7 @@ async function handleStatus({ req, res, fetchImpl, runtime, now, error: reportEr
         needsReconnect: true,
       });
     }
-    throw caught;
+      log(caught);
   }
 }
 
@@ -3072,36 +3102,6 @@ async function handleRevoke({ req, res, fetchImpl, runtime, now }) {
     connected: false,
     environment,
   });
-}
-
-function safeError(error, caught, path = '') {
-  if (typeof error === 'function') {
-    const route = cleanText(path, 80) || 'unknown';
-    const code =
-      caught instanceof HttpError
-        ? cleanText(caught.diagnosticCode, 80) || 'HTTP_' + caught.status
-        : caught instanceof UpstreamError
-          ? 'UPSTREAM_' + (caught.status || 'NETWORK')
-          : ['TypeError', 'ReferenceError', 'SyntaxError', 'RangeError'].includes(
-                cleanText(caught?.name, 32),
-              )
-            ? 'UNEXPECTED_' + cleanText(caught?.name, 32).toUpperCase()
-            : 'UNEXPECTED';
-    const status =
-      caught instanceof HttpError || caught instanceof UpstreamError
-        ? String(caught.status || 500)
-        : '500';
-    error(
-      'KeepFlip eBay OAuth backend request failed. route=' +
-        route +
-        ' status=' +
-        status +
-        ' reason=' +
-        code +
-        ' error=' +
-        JSON.stringify(caught),
-    );
-  }
 }
 
 export function createHandler({
