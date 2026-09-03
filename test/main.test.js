@@ -24,6 +24,17 @@ function jsonResponse(status, body = {}) {
   };
 }
 
+function binaryResponse(status, bytes) {
+  const value = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    text: async () => '',
+    arrayBuffer: async () =>
+      value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength),
+  };
+}
+
 function responseSink() {
   let response;
   return {
@@ -1043,6 +1054,40 @@ test('publishes with saved listing defaults when the request does not override t
       }
       if (
         request.url ===
+          'https://appwrite.example/v1/storage/buckets/item_images/files/photo-file-one' &&
+        options.method === 'GET'
+      ) {
+        return jsonResponse(200, {
+          $id: 'photo-file-one',
+          name: 'vintage-wool-jacket.jpg',
+          mimeType: 'image/jpeg',
+          $permissions: ['read("user:' + OWNER_ID + '")'],
+        });
+      }
+      if (
+        request.url ===
+          'https://appwrite.example/v1/storage/buckets/item_images/files/photo-file-one/download' &&
+        options.method === 'GET'
+      ) {
+        return binaryResponse(200, [0xff, 0xd8, 0xff, 0xd9]);
+      }
+      if (
+        request.url ===
+          'https://apim.sandbox.ebay.com/commerce/media/v1_beta/image/create_image_from_file' &&
+        options.method === 'POST'
+      ) {
+        assert.equal(options.headers.Authorization, 'Bearer ' + accessToken);
+        assert.equal(typeof options.body?.get, 'function');
+        const uploadedImage = options.body.get('image');
+        assert.equal(uploadedImage.type, 'image/jpeg');
+        assert.equal(uploadedImage.size, 4);
+        return jsonResponse(201, {
+          imageUrl:
+            'https://i.ebayimg.com/images/g/keepflip-photo-one/s-l1600.jpg',
+        });
+      }
+      if (
+        request.url ===
           'https://api.sandbox.ebay.com/sell/inventory/v1/inventory_item/KF-item-defaults-001' &&
         options.method === 'PUT'
       ) {
@@ -1130,12 +1175,155 @@ test('publishes with saved listing defaults when the request does not override t
     inventory.availability.shipToLocationAvailability.quantity,
     2,
   );
+  assert.deepEqual(inventory.product.imageUrls, [
+    'https://i.ebayimg.com/images/g/keepflip-photo-one/s-l1600.jpg',
+  ]);
+  assert.equal(
+    inventory.product.imageUrls.some((url) => url.includes('appwrite.example')),
+    false,
+  );
   assert.equal(
     JSON.stringify(sink.response().body).includes(accessToken),
     false,
   );
   assert.equal(
     JSON.stringify(sink.response().body).includes(refreshToken),
+    false,
+  );
+});
+
+test('returns an already-published eBay offer without rewriting the live listing', async () => {
+  configureEnvironment();
+  const accessToken = 'access-token-that-must-not-leak';
+  const refreshToken = 'refresh-token-that-must-not-leak';
+  const itemId = 'item-already-published-001';
+  const calls = [];
+  const errors = [];
+  const handler = createHandler({
+    fetchImpl: async (url, options = {}) => {
+      const request = { options, url: String(url) };
+      calls.push(request);
+
+      if (request.url.endsWith('/account')) {
+        return jsonResponse(200, { $id: OWNER_ID });
+      }
+      if (
+        request.url.endsWith('/rows/' + itemId) &&
+        options.method === 'GET'
+      ) {
+        return jsonResponse(200, {
+          $id: itemId,
+          ownerId: OWNER_ID,
+          title: 'Vintage wool jacket',
+          description: 'A clean vintage wool jacket with a classic fit.',
+          condition: 'USED_GOOD',
+        });
+      }
+      if (
+        request.url.endsWith(
+          '/rows/' + connectionRowId(OWNER_ID, 'sandbox'),
+        ) &&
+        options.method === 'GET'
+      ) {
+        return jsonResponse(200, {
+          ownerId: OWNER_ID,
+          encryptedTokens: tokenCiphertext({
+            accessToken,
+            accessTokenExpiresAt: '2026-08-25T13:00:00.000Z',
+            refreshToken,
+            refreshTokenExpiresAt: '2027-08-25T12:00:00.000Z',
+          }),
+          revokedAt: null,
+        });
+      }
+      if (
+        request.url.endsWith(
+          '/rows/' + sellerListingDefaultsRowId(OWNER_ID, 'sandbox', 'EBAY_US'),
+        ) &&
+        options.method === 'GET'
+      ) {
+        return jsonResponse(200, {
+          ownerId: OWNER_ID,
+          environment: 'sandbox',
+          marketplaceId: 'EBAY_US',
+          defaultMerchantLocationKey: 'warehouse-main',
+          defaultPaymentPolicyId: 'payment-policy-one',
+          defaultFulfillmentPolicyId: 'fulfillment-policy-one',
+          defaultReturnPolicyId: 'return-policy-one',
+          defaultListingDuration: 'GTC',
+          defaultCurrency: 'USD',
+          defaultQuantity: 1,
+        });
+      }
+      if (
+        request.url ===
+          'https://api.sandbox.ebay.com/sell/inventory/v1/offer?sku=KF-item-already-published-001&marketplace_id=EBAY_US' &&
+        options.method === 'GET'
+      ) {
+        return jsonResponse(200, {
+          offers: [
+            {
+              offerId: 'offer-already-published-001',
+              listingId: 'listing-already-published-001',
+              listingStartDate: NOW.toISOString(),
+              marketplaceId: 'EBAY_US',
+              status: 'PUBLISHED',
+            },
+          ],
+        });
+      }
+      if (
+        request.url.startsWith(
+          'https://appwrite.example/v1/tablesdb/keepflip/tables/ebay_seller_listings/rows/',
+        ) &&
+        options.method === 'PATCH'
+      ) {
+        return jsonResponse(200, { $id: 'listing-cache-row' });
+      }
+
+      throw new Error('Unexpected request: ' + request.url);
+    },
+    now: () => NOW,
+  });
+  const sink = responseSink();
+
+  await handler({
+    req: {
+      bodyJson: {
+        environment: 'sandbox',
+        itemId,
+        price: 50,
+        categoryId: '11450',
+      },
+      headers: authenticatedHeaders(),
+      method: 'POST',
+      path: '/listing',
+    },
+    res: sink.res,
+    error: (message) => errors.push(message),
+  });
+
+  assert.deepEqual(errors, []);
+  assert.deepEqual(sink.response().body, {
+    ok: true,
+    status: 'already_published',
+    environment: 'sandbox',
+    itemId,
+    sku: 'KF-item-already-published-001',
+    offerId: 'offer-already-published-001',
+    listingId: 'listing-already-published-001',
+    listingUrl:
+      'https://www.sandbox.ebay.com/itm/listing-already-published-001',
+    listingRecordSaved: true,
+  });
+  assert.equal(
+    calls.some(
+      (call) =>
+        call.url.includes('/sell/inventory/v1/inventory_item/') ||
+        (call.url === 'https://api.sandbox.ebay.com/sell/inventory/v1/offer' &&
+          call.options.method === 'POST') ||
+        call.url.endsWith('/publish'),
+    ),
     false,
   );
 });

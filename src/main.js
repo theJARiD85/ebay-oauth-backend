@@ -284,6 +284,101 @@ async function appwriteJson({
   return payload;
 }
 
+function storageFilePath(configuration, fileId, suffix = '') {
+  return (
+    '/storage/buckets/' +
+    encodeURIComponent(configuration.itemImagesBucketId) +
+    '/files/' +
+    encodeURIComponent(fileId) +
+    suffix
+  );
+}
+
+function ownerCanReadStoredFile(file, userId) {
+  const permissions = Array.isArray(file?.$permissions)
+    ? file.$permissions
+    : [];
+  const expected = 'read("user:' + userId + '")';
+  return permissions.some((permission) => permission === expected);
+}
+
+async function readItemPhotoForEbay({
+  fetchImpl,
+  req,
+  runtime,
+  configuration,
+  userId,
+  fileId,
+}) {
+  const apiKey = functionDynamicKey(req);
+  let file;
+  try {
+    file = await appwriteJson({
+      fetchImpl,
+      runtime,
+      apiKey,
+      path: storageFilePath(configuration, fileId),
+      failureMessage: 'KeepFlip could not read an item photo for eBay.',
+    });
+  } catch (caught) {
+    if (caught instanceof UpstreamError && caught.status === 404) {
+      error(
+        400,
+        'An item photo is no longer available. Reattach it before publishing on eBay.',
+      );
+    }
+    error(502, 'KeepFlip could not read an item photo for eBay.');
+  }
+
+  if (!ownerCanReadStoredFile(file, userId)) {
+    error(
+      403,
+      'KeepFlip could not verify that an item photo belongs to you. Reattach it before publishing on eBay.',
+    );
+  }
+
+  const mimeType = cleanText(file?.mimeType, 128).toLowerCase();
+  if (!mimeType.startsWith('image/')) {
+    error(400, 'Every eBay listing photo must be an image.');
+  }
+
+  let response;
+  try {
+    response = await fetchImpl(
+      runtime.endpoint + storageFilePath(configuration, fileId, '/download'),
+      {
+        method: 'GET',
+        headers: appwriteHeaders(runtime, { apiKey }),
+      },
+    );
+  } catch {
+    error(502, 'KeepFlip could not download an item photo for eBay.');
+  }
+
+  if (!response.ok) {
+    error(502, 'KeepFlip could not download an item photo for eBay.');
+  }
+
+  let bytes;
+  try {
+    bytes = await response.arrayBuffer();
+  } catch {
+    error(502, 'KeepFlip could not read an item photo for eBay.');
+  }
+
+  if (!Number.isFinite(bytes?.byteLength) || bytes.byteLength <= 0) {
+    error(400, 'An item photo is empty. Reattach it before publishing on eBay.');
+  }
+  if (typeof Blob !== 'function') {
+    error(500, 'The eBay publishing runtime cannot prepare listing photos.');
+  }
+
+  return {
+    blob: new Blob([bytes], { type: mimeType }),
+    name: cleanText(file?.name, 255) || fileId + '.jpg',
+  };
+}
+
 function tableRowsPath(configuration, tableId) {
   return (
     '/tablesdb/' +
@@ -1263,18 +1358,6 @@ async function getInventoryPhotoFileIds({
   return uniqueIds;
 }
 
-function appwriteFileViewUrl(runtime, configuration, fileId) {
-  return (
-    runtime.endpoint +
-    '/storage/buckets/' +
-    encodeURIComponent(configuration.itemImagesBucketId) +
-    '/files/' +
-    encodeURIComponent(fileId) +
-    '/view?project=' +
-    encodeURIComponent(runtime.projectId)
-  );
-}
-
 function ebayApiBase(configuration) {
   return configuration.environment === 'production'
     ? 'https://api.ebay.com'
@@ -1285,6 +1368,12 @@ function ebayIdentityApiBase(configuration) {
   return configuration.environment === 'production'
     ? 'https://apiz.ebay.com'
     : 'https://apiz.sandbox.ebay.com';
+}
+
+function ebayMediaApiBase(configuration) {
+  return configuration.environment === 'production'
+    ? 'https://apim.ebay.com'
+    : 'https://apim.sandbox.ebay.com';
 }
 
 function eBayApiErrorDetail(payload, rawBody) {
@@ -1351,6 +1440,99 @@ async function ebayApiRequest({
   }
 
   return { payload, status: response.status };
+}
+
+async function uploadEbayImageFromFile({
+  fetchImpl,
+  configuration,
+  accessToken,
+  image,
+}) {
+  if (typeof FormData !== 'function') {
+    error(500, 'The eBay publishing runtime cannot prepare listing photos.');
+  }
+
+  const form = new FormData();
+  form.append('image', image.blob, image.name);
+
+  let response;
+  try {
+    response = await fetchImpl(
+      ebayMediaApiBase(configuration) +
+        '/commerce/media/v1_beta/image/create_image_from_file',
+      {
+        method: 'POST',
+        headers: {
+          Accept: 'application/json',
+          Authorization: 'Bearer ' + accessToken,
+        },
+        body: form,
+      },
+    );
+  } catch {
+    error(502, 'KeepFlip could not upload an item photo to eBay.');
+  }
+
+  const rawBody = await response.text();
+  let payload = {};
+  if (rawBody.trim()) {
+    try {
+      payload = JSON.parse(rawBody);
+    } catch {
+      payload = {};
+    }
+  }
+
+  if (!response.ok) {
+    const detail = eBayApiErrorDetail(payload, rawBody);
+    const failure = new HttpError(
+      502,
+      'eBay rejected an item photo (HTTP ' +
+        response.status +
+        ')' +
+        (detail ? ': ' + detail : '.'),
+    );
+    failure.ebayStatus = response.status;
+    throw failure;
+  }
+
+  const imageUrl = safeExternalUrl(payload?.imageUrl);
+  if (!imageUrl) {
+    error(
+      502,
+      'eBay accepted an item photo but did not return a usable image URL.',
+    );
+  }
+  return imageUrl;
+}
+
+async function uploadInventoryPhotosToEbay({
+  fetchImpl,
+  req,
+  runtime,
+  configuration,
+  userId,
+  accessToken,
+  photoFileIds,
+}) {
+  return await Promise.all(
+    photoFileIds.map(async (fileId) => {
+      const image = await readItemPhotoForEbay({
+        fetchImpl,
+        req,
+        runtime,
+        configuration,
+        userId,
+        fileId,
+      });
+      return await uploadEbayImageFromFile({
+        fetchImpl,
+        configuration,
+        accessToken,
+        image,
+      });
+    }),
+  );
 }
 
 async function ensureEbayAccessToken({
@@ -2793,46 +2975,9 @@ async function handleEbayListing({
     );
   }
 
-  const photoFileIds = await getInventoryPhotoFileIds({
-    fetchImpl,
-    req,
-    runtime,
-    configuration,
-    item,
-  });
-  const imageUrls = photoFileIds.map((fileId) =>
-    appwriteFileViewUrl(runtime, configuration, fileId),
-  );
-
-  await ebayApiRequest({
-    fetchImpl,
-    configuration,
-    accessToken,
-    method: 'PUT',
-    path: '/sell/inventory/v1/inventory_item/' + encodeURIComponent(sku),
-    body: {
-      availability: { shipToLocationAvailability: { quantity } },
-      condition,
-      ...(conditionDescription ? { conditionDescription } : {}),
-      product: { title, description, imageUrls },
-    },
-  });
-
-  const offerPayload = {
-    sku,
-    marketplaceId,
-    format: 'FIXED_PRICE',
-    availableQuantity: quantity,
-    categoryId,
-    listingDescription: description,
-    listingDuration:
-      listingString(body.listingDuration, 30) ||
-      listingString(savedListingDefaults?.defaultListingDuration, 30) ||
-      'GTC',
-    merchantLocationKey,
-    pricingSummary: { price: { value: price.toFixed(2), currency } },
-    listingPolicies: { paymentPolicyId, fulfillmentPolicyId, returnPolicyId },
-  };
+  // A repeated tap after eBay has accepted the listing must be a no-op. In
+  // particular, do not rewrite the live inventory item before returning the
+  // already-published result.
   const existingOffer = await findExistingEbayOffer({
     fetchImpl,
     configuration,
@@ -2882,6 +3027,53 @@ async function handleEbayListing({
       listingRecordSaved,
     });
   }
+
+  const photoFileIds = await getInventoryPhotoFileIds({
+    fetchImpl,
+    req,
+    runtime,
+    configuration,
+    item,
+  });
+  const imageUrls = await uploadInventoryPhotosToEbay({
+    fetchImpl,
+    req,
+    runtime,
+    configuration,
+    userId,
+    accessToken,
+    photoFileIds,
+  });
+
+  await ebayApiRequest({
+    fetchImpl,
+    configuration,
+    accessToken,
+    method: 'PUT',
+    path: '/sell/inventory/v1/inventory_item/' + encodeURIComponent(sku),
+    body: {
+      availability: { shipToLocationAvailability: { quantity } },
+      condition,
+      ...(conditionDescription ? { conditionDescription } : {}),
+      product: { title, description, imageUrls },
+    },
+  });
+
+  const offerPayload = {
+    sku,
+    marketplaceId,
+    format: 'FIXED_PRICE',
+    availableQuantity: quantity,
+    categoryId,
+    listingDescription: description,
+    listingDuration:
+      listingString(body.listingDuration, 30) ||
+      listingString(savedListingDefaults?.defaultListingDuration, 30) ||
+      'GTC',
+    merchantLocationKey,
+    pricingSummary: { price: { value: price.toFixed(2), currency } },
+    listingPolicies: { paymentPolicyId, fulfillmentPolicyId, returnPolicyId },
+  };
 
   if (offerId) {
     await ebayApiRequest({
