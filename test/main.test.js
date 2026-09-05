@@ -990,6 +990,8 @@ test('syncs safe eBay policies, locations, and unambiguous listing defaults', as
 });
 test('publishes with saved listing defaults when the request does not override them', async () => {
   configureEnvironment();
+  process.env.APPWRITE_SUBSCRIPTION_POLICE_FUNCTION_ID = 'quota-test';
+  process.env.SELLER_QUOTA_INTERNAL_SECRET = 'server-test-secret';
   const accessToken = 'access-token-that-must-not-leak';
   const refreshToken = 'refresh-token-that-must-not-leak';
   const itemId = 'item-defaults-001';
@@ -1000,6 +1002,10 @@ test('publishes with saved listing defaults when the request does not override t
       const request = { options, url: String(url) };
       calls.push(request);
 
+      if (request.url.endsWith('/identity/v1/oauth2/token')) return jsonResponse(200, { access_token: 'application-token' });
+      if (request.url.includes('/get_default_category_tree_id?')) return jsonResponse(200, { categoryTreeId: '0' });
+      if (request.url.includes('/get_item_aspects_for_category?')) return jsonResponse(200, { aspects: [] });
+      if (request.url.endsWith('/functions/quota-test/executions')) return jsonResponse(201, { status: 'completed', responseStatusCode: 200, responseBody: JSON.stringify({ ok: true, allowed: true, dispatch: true }) });
       if (request.url.endsWith('/account')) {
         return jsonResponse(200, { $id: OWNER_ID });
       }
@@ -1013,6 +1019,7 @@ test('publishes with saved listing defaults when the request does not override t
           title: 'Vintage wool jacket',
           description: 'A clean vintage wool jacket with a classic fit.',
           condition: 'USED_GOOD',
+          quantityOnHand: 2,
           coverPhotoId: 'photo-file-one',
         });
       }
@@ -1135,6 +1142,7 @@ test('publishes with saved listing defaults when the request does not override t
         itemId,
         price: 50,
         categoryId: '11450',
+        review: { identityConfirmed: true, photosReviewed: true, conditionConfirmed: true, measurementsConfirmed: true, shippingConfirmed: true, returnsConfirmed: true, measurements: 'not_applicable' },
       },
       headers: authenticatedHeaders(),
       method: 'POST',

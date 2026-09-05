@@ -1,3 +1,6 @@
+import { reserveListingQuota } from './server-quota.js';
+import { seriousSubscriptionAllows, fulfillmentRequest, fetchSellerOrders, shipSellerOrder } from './fulfillment-adapter.js';
+import { resolveListingDraft, readCategoryAspects, evaluateListingReadiness } from './listing-readiness.js';
 import {
   createCipheriv,
   createDecipheriv,
@@ -11,6 +14,7 @@ export const KEEPFLIP_EBAY_USER_SCOPES = Object.freeze([
   'https://api.ebay.com/oauth/api_scope/sell.inventory',
   'https://api.ebay.com/oauth/api_scope/sell.account.readonly',
   'https://api.ebay.com/oauth/api_scope/sell.finances',
+  'https://api.ebay.com/oauth/api_scope/sell.fulfillment',
 ]);
 
 const STATE_TTL_MS = 10 * 60 * 1000;
@@ -2822,6 +2826,73 @@ async function handleSellerAccount({
     ...cachedListings,
   });
 }
+async function listingReadiness({ req, fetchImpl, runtime, configuration, userId, body, item, connection, resolved, defaultsUnavailable = false, now }) {
+  return evaluateListingReadiness({ body, item, resolved, defaultsUnavailable, connected: !!connection && !connection.revokedAt,
+    now: () => currentDate(now),
+    readPhotos: () => getInventoryPhotoFileIds({ fetchImpl, req, runtime, configuration, item }),
+    verifyPhoto: async fileId => {
+      const file = await appwriteJson({ fetchImpl, runtime, apiKey: functionDynamicKey(req), path: storageFilePath(configuration, fileId), failureMessage: 'Photo unavailable.' });
+      if (!ownerCanReadStoredFile(file, userId) || !cleanText(file.mimeType).startsWith('image/')) throw new Error('Photo unavailable.');
+    },
+    readAspects: () => readCategoryAspects({ fetchImpl, configuration, marketplaceId: resolved.marketplaceId, categoryId: resolved.categoryId }),
+  });
+}
+
+async function handleListingReadiness({ req, res, fetchImpl, runtime, now }) {
+  const body = requestBody(req);
+  const configuration = configurationFor(normalizeEnvironment(body.environment));
+  const userId = await authenticatedUserId({ req, fetchImpl, runtime });
+  const item = await getOwnedInventoryItem({ req, fetchImpl, runtime, configuration, userId, itemId: requiredListingValue(body, 'itemId', 64) });
+  const connection = await getConnection({ req, fetchImpl, runtime, configuration, userId });
+  let defaults = null;
+  let defaultsUnavailable = false;
+  try { defaults = await readSellerListingDefaults({ req, fetchImpl, runtime, configuration, userId, marketplaceId: listingString(body.marketplaceId).toUpperCase() || 'EBAY_US' }); }
+  catch { defaultsUnavailable = true; }
+  const resolved = resolveListingDraft({ body, item, defaults, normalizeCondition: normalizeInventoryCondition });
+  const result = await listingReadiness({ req, fetchImpl, runtime, configuration, userId, body, item, connection, resolved, defaultsUnavailable, now });
+  return res.json(result.response);
+}
+
+async function handleOrders({ req, res, fetchImpl, runtime, now, randomBytesImpl, ship = false }) {
+  const body = requestBody(req);
+  const configuration = configurationFor(normalizeEnvironment(body.environment));
+  const userId = await authenticatedUserId({ req, fetchImpl, runtime });
+  const subscription = await getServerRowOrNull({ req, fetchImpl, runtime, configuration,
+    tableId: firstEnvironmentValue(['APPWRITE_USER_SUBSCRIPTIONS_TABLE_ID'], 'user_subscription'), rowId: userId,
+    failureMessage: 'KeepFlip could not verify the seller subscription.' });
+  if (!seriousSubscriptionAllows(subscription, userId, currentDate(now))) error(403, 'An active Serious seller subscription is required for eBay automation.', 'SERIOUS_SUBSCRIPTION_REQUIRED');
+  const connection = await getConnection({ req, fetchImpl, runtime, configuration, userId });
+  if (!connection || connection.revokedAt) error(403, 'Connect an eBay account before using fulfillment.', 'EBAY_CONNECTION_REQUIRED');
+  const accessToken = await ensureEbayAccessToken({ req, fetchImpl, runtime, configuration, connection, now, randomBytesImpl });
+  const context = { body, userId, environment: configuration.environment,
+    connectionId: connection.$id || connectionRowId(userId, configuration.environment), fail: error,
+    request: (path, method = 'GET', payload) => fulfillmentRequest({ fetchImpl, configuration, accessToken, path, method, body: payload, fail: error }),
+  };
+  if (!ship) return res.json(await fetchSellerOrders(context));
+  const claim = async (operationId, data) => {
+    const tableId = requiredEnvironmentValue(['APPWRITE_EBAY_SHIPMENT_OPERATIONS_TABLE_ID']);
+    const path = rowPath(configuration, tableId, operationId);
+    let reconcileOnly = false;
+    try {
+      await appwriteJson({ req, fetchImpl, runtime, apiKey: functionDynamicKey(req), method: 'POST',
+        path: tableRowsPath(configuration, tableId), body: { rowId: operationId, data: { ownerId: userId, environment: configuration.environment, requestHash: data.requestHash, createdAt: currentDate(now).toISOString() }, permissions: [] }, failureMessage: 'Could not reserve shipment.' });
+    } catch (caught) {
+      if (!(caught instanceof UpstreamError) || caught.status !== 409) error(503, 'Shipment reservations are unavailable.', 'SHIPMENT_RESERVATION_UNAVAILABLE');
+      const existing = await appwriteJson({ req, fetchImpl, runtime, apiKey: functionDynamicKey(req), path, failureMessage: 'Could not read shipment reservation.' });
+      if (existing.ownerId !== userId || existing.environment !== configuration.environment || existing.requestHash !== data.requestHash) error(409, 'Another shipment is pending for this order. Reconcile it first.', 'SHIPMENT_RECONCILIATION_REQUIRED');
+      reconcileOnly = true;
+    }
+    return { reconcileOnly, complete: async () => {
+      // Only the request that created the lock may release it. A reconciliation
+      // reader must never delete a lock while its original writer is in flight.
+      if (reconcileOnly) return;
+      try { await appwriteJson({ req, fetchImpl, runtime, apiKey: functionDynamicKey(req), path, method: 'DELETE', failureMessage: 'Could not finalize shipment reservation.' }); }
+      catch { /* Retain the lock. Provider success must still be returned. */ }
+    } };
+  };
+  return res.json(await shipSellerOrder({ ...context, claim, now: () => currentDate(now) }));
+}
+
 async function handleEbayListing({
   req,
   res,
@@ -2864,10 +2935,10 @@ async function handleEbayListing({
     randomBytesImpl,
   });
 
-  const listingPolicies = bodyObject(body.listingPolicies);
   const marketplaceId =
     listingString(body.marketplaceId, 40).toUpperCase() || 'EBAY_US';
   let savedListingDefaults = null;
+  let defaultsUnavailable = false;
   try {
     savedListingDefaults = await readSellerListingDefaults({
       fetchImpl,
@@ -2878,102 +2949,12 @@ async function handleEbayListing({
       marketplaceId,
     });
   } catch {
-    // A saved preset is optional. Explicit listing-policy values still work
-    // when its cache is temporarily unavailable.
+    defaultsUnavailable = true;
   }
-  const title =
-    listingString(body.title, 80) ||
-    listingString(item.title, 80) ||
-    [item.brand, item.model, item.category]
-      .map((value) => listingString(value, 80))
-      .filter(Boolean)
-      .join(' ')
-      .slice(0, 80);
-  const description =
-    listingString(body.description, 500_000) ||
-    listingString(item.description, 500_000);
-  if (!title) error(400, 'eBay listings need a title.');
-  if (!description) error(400, 'eBay listings need a description.');
-
-  const price = listingNumber(
-    body.price ??
-      (body.priceCents === undefined ? undefined : Number(body.priceCents) / 100),
-    'price',
-    { minimum: 0.01 },
-  );
-  const quantity = listingNumber(
-    body.quantity ?? savedListingDefaults?.defaultQuantity ?? 1,
-    'quantity',
-    {
-      integer: true,
-      minimum: 1,
-    },
-  );
-  const categoryId =
-    listingString(body.categoryId, 20) ||
-    listingString(savedListingDefaults?.defaultCategoryId, 20);
-  if (!categoryId) {
-    error(400, 'eBay listing field "categoryId" is required.');
-  }
-  if (!/^\d+$/.test(categoryId)) {
-    error(400, 'eBay categoryId must be a numeric category ID.');
-  }
-
-  const merchantLocationKey =
-    listingString(body.merchantLocationKey, 100) ||
-    listingString(listingPolicies.merchantLocationKey, 100) ||
-    listingString(savedListingDefaults?.defaultMerchantLocationKey, 100);
-  if (!merchantLocationKey) {
-    error(
-      400,
-      'Finish your saved eBay listing setup in Seller Account, then try again.',
-    );
-  }
-  const paymentPolicyId =
-    listingString(body.paymentPolicyId, 100) ||
-    listingString(listingPolicies.paymentPolicyId, 100) ||
-    listingString(savedListingDefaults?.defaultPaymentPolicyId, 100);
-  if (!paymentPolicyId) {
-    error(
-      400,
-      'Finish your saved eBay listing setup in Seller Account, then try again.',
-    );
-  }
-  const fulfillmentPolicyId =
-    listingString(body.fulfillmentPolicyId, 100) ||
-    listingString(listingPolicies.fulfillmentPolicyId, 100) ||
-    listingString(savedListingDefaults?.defaultFulfillmentPolicyId, 100);
-  if (!fulfillmentPolicyId) {
-    error(
-      400,
-      'Finish your saved eBay listing setup in Seller Account, then try again.',
-    );
-  }
-  const returnPolicyId =
-    listingString(body.returnPolicyId, 100) ||
-    listingString(listingPolicies.returnPolicyId, 100) ||
-    listingString(savedListingDefaults?.defaultReturnPolicyId, 100);
-  if (!returnPolicyId) {
-    error(
-      400,
-      'Finish your saved eBay listing setup in Seller Account, then try again.',
-    );
-  }
-  const currency =
-    listingString(body.currency, 3).toUpperCase() ||
-    listingString(savedListingDefaults?.defaultCurrency, 3).toUpperCase() ||
-    'USD';
-  const condition = normalizeInventoryCondition(body.condition || item.condition);
-  const conditionDescription = ['NEW', 'LIKE_NEW', 'NEW_OTHER', 'NEW_WITH_DEFECTS'].includes(condition)
-    ? ''
-    : listingString(body.conditionDescription || item.conditionNotes || item.description, 1_000);
-  const sku = listingString(body.sku, 50) || ('KF-' + itemId).slice(0, 50);
-  if (!/^[A-Za-z0-9._-]+$/.test(sku)) {
-    error(
-      400,
-      'eBay SKU may contain only letters, numbers, periods, underscores, and hyphens.',
-    );
-  }
+  const resolved = resolveListingDraft({ body, item, defaults: savedListingDefaults, normalizeCondition: normalizeInventoryCondition });
+  const { title, description, price, quantity, categoryId, merchantLocationKey,
+    paymentPolicyId, fulfillmentPolicyId, returnPolicyId, currency, condition,
+    conditionDescription, sku, aspects } = resolved;
 
   // A repeated tap after eBay has accepted the listing must be a no-op. In
   // particular, do not rewrite the live inventory item before returning the
@@ -3028,13 +3009,10 @@ async function handleEbayListing({
     });
   }
 
-  const photoFileIds = await getInventoryPhotoFileIds({
-    fetchImpl,
-    req,
-    runtime,
-    configuration,
-    item,
-  });
+  const readiness = await listingReadiness({ req, fetchImpl, runtime, configuration, userId, body, item, connection, resolved, defaultsUnavailable, now });
+  if (!readiness.response.ready) return res.json({ ...readiness.response, ok: false, code: 'LISTING_NOT_READY', error: 'Complete the missing listing fields.' }, 422);
+  await reserveListingQuota({ req, runtime, fetchImpl, userId, environment, marketplaceId, sku, fail: error });
+  const photoFileIds = readiness.photoFileIds;
   const imageUrls = await uploadInventoryPhotosToEbay({
     fetchImpl,
     req,
@@ -3055,7 +3033,7 @@ async function handleEbayListing({
       availability: { shipToLocationAvailability: { quantity } },
       condition,
       ...(conditionDescription ? { conditionDescription } : {}),
-      product: { title, description, imageUrls },
+      product: { title, description, imageUrls, aspects },
     },
   });
 
@@ -3441,6 +3419,9 @@ export function createHandler({
             '/refresh',
             '/revoke',
             '/listing',
+            '/listing/readiness',
+            '/orders',
+            '/orders/ship',
             '/seller-account',
           ],
         });
@@ -3455,6 +3436,14 @@ export function createHandler({
           now,
           randomBytesImpl,
         });
+      }
+
+      if (req?.method === 'POST' && (path === '/orders' || path === '/orders/ship')) {
+        return await handleOrders({ req, res, fetchImpl, runtime, now, randomBytesImpl, ship: path === '/orders/ship' });
+      }
+
+      if (req?.method === 'POST' && path === '/listing/readiness') {
+        return await handleListingReadiness({ req, res, fetchImpl, runtime, now });
       }
 
       if (req?.method === 'POST' && path === '/listing') {
@@ -3512,6 +3501,7 @@ export function createHandler({
 
       return res.json(
         {
+          ...(['/orders', '/orders/ship', '/listing', '/listing/readiness'].includes(path) && caught instanceof HttpError ? { code: caught.diagnosticCode } : {}),
           error:
             status >= 500
               ? 'KeepFlip could not complete the eBay OAuth request.'
